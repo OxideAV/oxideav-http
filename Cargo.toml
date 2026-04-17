@@ -1,20 +1,20 @@
 [package]
 name = "oxideav-http"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
-authors.workspace = true
+version = "0.0.3"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-http"
+authors = ["Mark Karpeles"]
 description = "HTTP/HTTPS source driver for oxideav (pure-Rust via ureq + rustls + webpki-roots)"
 
 readme = "README.md"
-homepage.workspace = true
+homepage = "https://github.com/OxideAV/oxideav-http"
 keywords = ["multimedia", "http", "streaming", "io", "pure-rust"]
 categories = ["multimedia", "network-programming"]
 
 [dependencies]
-oxideav-core = { workspace = true }
-oxideav-container = { workspace = true }
-oxideav-source = { workspace = true }
+oxideav-core = "0.0"
+oxideav-container = "0.0"
+oxideav-source = "0.0"
 ureq = "3"
