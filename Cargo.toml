@@ -16,5 +16,5 @@ categories = ["multimedia", "network-programming"]
 [dependencies]
 oxideav-core = "0.1"
 oxideav-container = "0.1"
-oxideav-source = "0.0"
+oxideav-source = "0.1"
 ureq = "3"
