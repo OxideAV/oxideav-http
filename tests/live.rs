@@ -63,7 +63,7 @@ fn registry_dispatch_via_https_scheme() {
         eprintln!("skip: set OXIDEAV_LIVE_HTTP_TESTS=1 to enable");
         return;
     }
-    let mut reg = oxideav_source::SourceRegistry::with_defaults();
+    let mut reg = oxideav_source::with_defaults();
     oxideav_http::register(&mut reg);
     let mut s = reg.open(URL).expect("registry open");
     let mut head = [0u8; 32];

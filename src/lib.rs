@@ -8,7 +8,7 @@
 //! Wire it into a [`oxideav_source::SourceRegistry`] with [`register`]:
 //!
 //! ```no_run
-//! let mut reg = oxideav_source::SourceRegistry::with_defaults();
+//! let mut reg = oxideav_source::with_defaults();
 //! oxideav_http::register(&mut reg);
 //! let _r = reg.open("https://example.com/clip.mp4").unwrap();
 //! ```
