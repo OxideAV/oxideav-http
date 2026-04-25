@@ -16,7 +16,7 @@
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::OnceLock;
 
-use oxideav_container::ReadSeek;
+use oxideav_core::ReadSeek;
 use oxideav_core::{Error, Result};
 use oxideav_source::SourceRegistry;
 use ureq::Agent;
