@@ -65,7 +65,10 @@ fn registry_dispatch_via_https_scheme() {
     }
     let mut reg = oxideav_source::with_defaults();
     oxideav_http::register(&mut reg);
-    let mut s = reg.open(URL).expect("registry open");
+    let mut s = match reg.open(URL).expect("registry open") {
+        oxideav_source::SourceOutput::Bytes(b) => b,
+        _ => panic!("expected SourceOutput::Bytes from the http driver"),
+    };
     let mut head = [0u8; 32];
     s.read_exact(&mut head).expect("read");
     assert!(head.iter().any(|&b| b != 0));

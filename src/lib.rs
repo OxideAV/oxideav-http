@@ -1,11 +1,13 @@
 //! HTTP/HTTPS source driver for oxideav.
 //!
 //! Implements `Read + Seek` over HTTP `Range` requests so any container
-//! demuxer that takes a `Box<dyn ReadSeek>` can read directly from a URL.
-//! Servers must support `Range: bytes=…` (most static-file hosts do; we
-//! verify with a `HEAD` at construction).
+//! demuxer that takes a `Box<dyn BytesSource>` can read directly from a
+//! URL. Servers must support `Range: bytes=…` (most static-file hosts
+//! do; we verify with a `HEAD` at construction).
 //!
 //! Wire it into a [`oxideav_source::SourceRegistry`] with [`register`]:
+//! both `http` and `https` register as bytes-shape sources, so
+//! `reg.open(uri)` yields `SourceOutput::Bytes(_)`.
 //!
 //! ```no_run
 //! let mut reg = oxideav_source::with_defaults();
@@ -16,19 +18,20 @@
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::OnceLock;
 
-use oxideav_core::ReadSeek;
+use oxideav_core::BytesSource;
 use oxideav_core::{Error, Result};
 use oxideav_source::SourceRegistry;
 use ureq::Agent;
 
-/// Register the `http` and `https` schemes on the registry.
+/// Register the `http` and `https` schemes on the registry as bytes
+/// sources. Both schemes share the same opener (`open_http`).
 pub fn register(registry: &mut SourceRegistry) {
-    registry.register("http", open_http);
-    registry.register("https", open_http);
+    registry.register_bytes("http", open_http);
+    registry.register_bytes("https", open_http);
 }
 
-/// Open a URL as a seekable source.
-pub fn open_http(uri: &str) -> Result<Box<dyn ReadSeek>> {
+/// Open a URL as a seekable byte source.
+pub fn open_http(uri: &str) -> Result<Box<dyn BytesSource>> {
     let src = HttpSource::open(uri)?;
     Ok(Box::new(src))
 }

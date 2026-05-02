@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking**: Migrated to the new typed `SourceRegistry` API in
+  `oxideav-core`. `register(&mut SourceRegistry)` now calls
+  `register_bytes("http", open_http)` and `register_bytes("https",
+  open_http)` (was `register(…)`); `open_http` returns
+  `Box<dyn BytesSource>` (was `Box<dyn ReadSeek>`). `HttpSource`
+  itself is unchanged — it continues to satisfy `Read + Seek + Send`,
+  so the blanket `BytesSource` impl in `oxideav-core` picks it up
+  automatically.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-http/compare/v0.0.3...v0.0.4) - 2026-04-25
 
 ### Fixed
