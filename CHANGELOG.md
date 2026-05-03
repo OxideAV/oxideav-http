@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-http/compare/v0.0.4...v0.0.5) - 2026-05-03
+
+### Other
+
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- stay on 0.1.x during heavy dev (semver_check=false)
+- Migrate http(s):// driver to SourceRegistry typed-bytes API
+- pin release-plz to patch-only bumps
+
 ### Changed
 
 - **Breaking**: Migrated to the new typed `SourceRegistry` API in
