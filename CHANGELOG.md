@@ -19,8 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking**: Unified entry point on `register(&mut RuntimeContext)`
+  to match the convention every sibling crate now follows (#502). The
+  previous `register(reg: &mut SourceRegistry)` was renamed to
+  `register_source(reg: &mut SourceRegistry)`; `register(ctx)` calls
+  `register_source(&mut ctx.sources)` internally. Direct
+  `oxideav_http::register(&mut some_source_registry)` callers must
+  switch to either `register(&mut ctx)` (preferred) or the renamed
+  `register_source(&mut some_source_registry)`.
 - **Breaking**: Migrated to the new typed `SourceRegistry` API in
-  `oxideav-core`. `register(&mut SourceRegistry)` now calls
+  `oxideav-core`. `register_source(&mut SourceRegistry)` now calls
   `register_bytes("http", open_http)` and `register_bytes("https",
   open_http)` (was `register(…)`); `open_http` returns
   `Box<dyn BytesSource>` (was `Box<dyn ReadSeek>`). `HttpSource`

@@ -5,27 +5,42 @@
 //! URL. Servers must support `Range: bytes=…` (most static-file hosts
 //! do; we verify with a `HEAD` at construction).
 //!
-//! Wire it into a [`oxideav_source::SourceRegistry`] with [`register`]:
+//! Wire it into a [`oxideav_core::RuntimeContext`] with [`register`]:
 //! both `http` and `https` register as bytes-shape sources, so
-//! `reg.open(uri)` yields `SourceOutput::Bytes(_)`.
+//! `ctx.sources.open(uri)` yields `SourceOutput::Bytes(_)`. For callers
+//! that hold a bare [`oxideav_source::SourceRegistry`] use
+//! [`register_source`] directly.
 //!
 //! ```no_run
-//! let mut reg = oxideav_source::with_defaults();
-//! oxideav_http::register(&mut reg);
-//! let _r = reg.open("https://example.com/clip.mp4").unwrap();
+//! let mut ctx = oxideav_core::RuntimeContext::new();
+//! oxideav_http::register(&mut ctx);
+//! let _r = ctx.sources.open("https://example.com/clip.mp4").unwrap();
 //! ```
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::OnceLock;
 
 use oxideav_core::BytesSource;
+use oxideav_core::RuntimeContext;
 use oxideav_core::{Error, Result};
 use oxideav_source::SourceRegistry;
 use ureq::Agent;
 
-/// Register the `http` and `https` schemes on the registry as bytes
-/// sources. Both schemes share the same opener (`open_http`).
-pub fn register(registry: &mut SourceRegistry) {
+/// Install the `http` + `https` schemes into a full runtime context.
+///
+/// This is the unified entry point every sibling crate exposes; it
+/// just forwards to [`register_source`] on `ctx.sources`.
+pub fn register(ctx: &mut RuntimeContext) {
+    register_source(&mut ctx.sources);
+}
+
+/// Register the `http` and `https` schemes on a bare
+/// [`SourceRegistry`] as bytes sources. Both schemes share the same
+/// opener (`open_http`).
+///
+/// Most callers should use [`register`] instead — it threads through a
+/// full [`RuntimeContext`].
+pub fn register_source(registry: &mut SourceRegistry) {
     registry.register_bytes("http", open_http);
     registry.register_bytes("https", open_http);
 }
@@ -171,5 +186,35 @@ fn add_signed(base: u64, delta: i64) -> io::Result<u64> {
     } else {
         base.checked_sub(delta.unsigned_abs())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek before start"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn register_via_runtime_context_installs_http_and_https_schemes() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let schemes: BTreeSet<&str> = ctx.sources.schemes().collect();
+        assert!(
+            schemes.contains("http"),
+            "register did not install http; got {schemes:?}"
+        );
+        assert!(
+            schemes.contains("https"),
+            "register did not install https; got {schemes:?}"
+        );
+    }
+
+    #[test]
+    fn register_source_installs_http_and_https_schemes_on_bare_registry() {
+        let mut reg = SourceRegistry::new();
+        register_source(&mut reg);
+        let schemes: BTreeSet<&str> = reg.schemes().collect();
+        assert!(schemes.contains("http"));
+        assert!(schemes.contains("https"));
     }
 }

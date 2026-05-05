@@ -63,9 +63,13 @@ fn registry_dispatch_via_https_scheme() {
         eprintln!("skip: set OXIDEAV_LIVE_HTTP_TESTS=1 to enable");
         return;
     }
-    let mut reg = oxideav_source::with_defaults();
-    oxideav_http::register(&mut reg);
-    let mut s = match reg.open(URL).expect("registry open") {
+    // Compose a full RuntimeContext, install file-scheme defaults,
+    // then layer http/https onto `ctx.sources` via the unified
+    // `register(&mut RuntimeContext)` entry point.
+    let mut ctx = oxideav_core::RuntimeContext::new();
+    ctx.sources = oxideav_source::with_defaults();
+    oxideav_http::register(&mut ctx);
+    let mut s = match ctx.sources.open(URL).expect("registry open") {
         oxideav_source::SourceOutput::Bytes(b) => b,
         _ => panic!("expected SourceOutput::Bytes from the http driver"),
     };
