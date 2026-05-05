@@ -17,3 +17,7 @@ categories = ["multimedia", "network-programming"]
 oxideav-core = "0.1"
 oxideav-source = "0.1"
 ureq = "3"
+# Distributed-slice auto-registration into `oxideav_core::REGISTRARS`
+# via the `oxideav_core::register!` macro. Tiny crate, no transitive
+# deps; works on every target including wasm.
+linkme = "0.3"

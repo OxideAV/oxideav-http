@@ -34,6 +34,8 @@ pub fn register(ctx: &mut RuntimeContext) {
     register_source(&mut ctx.sources);
 }
 
+oxideav_core::register!("http", register);
+
 /// Register the `http` and `https` schemes on a bare
 /// [`SourceRegistry`] as bytes sources. Both schemes share the same
 /// opener (`open_http`).
