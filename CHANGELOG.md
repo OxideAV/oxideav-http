@@ -7,16 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.0.5](https://github.com/OxideAV/oxideav-http/compare/v0.0.4...v0.0.5) - 2026-05-03
-
-### Other
-
-- replace never-match regex with semver_check = false
-- migrate to centralized OxideAV/.github reusable workflows
-- stay on 0.1.x during heavy dev (semver_check=false)
-- Migrate http(s):// driver to SourceRegistry typed-bytes API
-- pin release-plz to patch-only bumps
-
 ### Changed
 
 - **Breaking**: Unified entry point on `register(&mut RuntimeContext)`
@@ -27,14 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `oxideav_http::register(&mut some_source_registry)` callers must
   switch to either `register(&mut ctx)` (preferred) or the renamed
   `register_source(&mut some_source_registry)`.
-- **Breaking**: Migrated to the new typed `SourceRegistry` API in
-  `oxideav-core`. `register_source(&mut SourceRegistry)` now calls
-  `register_bytes("http", open_http)` and `register_bytes("https",
-  open_http)` (was `register(…)`); `open_http` returns
-  `Box<dyn BytesSource>` (was `Box<dyn ReadSeek>`). `HttpSource`
-  itself is unchanged — it continues to satisfy `Read + Seek + Send`,
-  so the blanket `BytesSource` impl in `oxideav-core` picks it up
-  automatically.
+
+## [0.0.5](https://github.com/OxideAV/oxideav-http/compare/v0.0.4...v0.0.5) - 2026-05-03
+
+### Other
+
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- stay on 0.1.x during heavy dev (semver_check=false)
+- Migrate http(s):// driver to SourceRegistry typed-bytes API
+- pin release-plz to patch-only bumps
 
 ## [0.0.4](https://github.com/OxideAV/oxideav-http/compare/v0.0.3...v0.0.4) - 2026-04-25
 
