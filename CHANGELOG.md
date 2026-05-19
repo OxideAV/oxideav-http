@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `HttpConfig` + `HttpConfigBuilder` policy struct for the underlying
+  `ureq` agent, exposing `max_redirects`, `max_redirects_will_error`,
+  `redirect_auth_policy` (`Never` / `SameHost`), `user_agent`,
+  `https_only`, `timeout_global`, `timeout_connect`. Crate surface stays
+  independent of which client we wire in.
+- `install_default_config(cfg)` — one-shot installer for the
+  process-wide agent used by `register` / `register_source` / the
+  `http://` + `https://` scheme handlers on `SourceRegistry`. Returns
+  `ConfigAlreadyInstalled` once the global agent has materialised.
+- `HttpSource::open_with_config(uri, &cfg)` — per-call override that
+  builds a one-off `ureq::Agent` owned by the returned `HttpSource`,
+  leaving the process default untouched.
+- 6 new unit tests cover default surface, builder thread-through, every
+  `RedirectAuthPolicy` variant lighting up the `agent_from` path,
+  one-shot install semantics, and the `ConfigAlreadyInstalled`
+  `std::error::Error` impl.
+
+### Changed
+
+- Default agent is now lazily built from `DEFAULT_CONFIG` (or library
+  defaults if none is installed) instead of an unparameterised
+  `Agent::config_builder().build().new_agent()`. No behaviour change
+  when `install_default_config` is not called.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-http/compare/v0.0.5...v0.0.6) - 2026-05-06
 
 ### Other
