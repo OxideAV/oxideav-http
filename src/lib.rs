@@ -405,12 +405,171 @@ impl HttpSource {
                 self.uri, range
             )));
         }
+        let pos = self.pos;
+        let total_len = self.total_len;
+        // Per RFC 7233 §3.1, a server that does not support (or chooses
+        // to ignore) Range MAY answer a range request with a full 200
+        // response. In that case we must drop the prefix [0, self.pos)
+        // before exposing bytes to the reader so the demuxer keeps a
+        // consistent file-offset view.
+        let skip_prefix = if status == 200 { pos } else { 0 };
+        if status == 206 {
+            // RFC 7233 §4.2: validate the server's Content-Range echo
+            // covers what we asked for and is self-consistent. A 206
+            // without Content-Range, or with a multipart/byteranges
+            // (handled at the body layer, not via Content-Range), or
+            // with a different first-byte-pos than self.pos, would
+            // silently misalign every subsequent read.
+            let cr_raw = resp
+                .headers()
+                .get("content-range")
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "HTTP 206 {} {}: missing Content-Range",
+                        self.uri, range
+                    ))
+                })?
+                .to_str()
+                .map_err(|_| {
+                    io::Error::other(format!(
+                        "HTTP 206 {} {}: non-ASCII Content-Range",
+                        self.uri, range
+                    ))
+                })?
+                .to_owned();
+            let parsed = parse_byte_content_range(&cr_raw).map_err(|e| {
+                io::Error::other(format!(
+                    "HTTP 206 {} {}: invalid Content-Range '{cr_raw}': {e}",
+                    self.uri, range
+                ))
+            })?;
+            // first-byte-pos MUST match the position we asked for. The
+            // server is allowed to satisfy a partial subrange, but
+            // not to slide the start.
+            if parsed.first != pos {
+                return Err(io::Error::other(format!(
+                    "HTTP 206 {} {}: Content-Range first-byte-pos {} != requested pos {}",
+                    self.uri, range, parsed.first, pos
+                )));
+            }
+            // complete-length, when concrete, must equal the size we
+            // recorded at HEAD. A mid-stream resource resize is a
+            // cache/origin mismatch we cannot recover from in-band.
+            if let Some(complete) = parsed.complete {
+                if complete != total_len {
+                    return Err(io::Error::other(format!(
+                        "HTTP 206 {} {}: Content-Range complete-length {complete} != known total {total_len}",
+                        self.uri, range
+                    )));
+                }
+            }
+            // last-byte-pos must lie inside the representation we
+            // expect.
+            if parsed.last >= total_len {
+                return Err(io::Error::other(format!(
+                    "HTTP 206 {} {}: Content-Range last-byte-pos {} >= total {}",
+                    self.uri, range, parsed.last, total_len
+                )));
+            }
+        }
         // ureq 3: Body owns the stream; into_body().into_reader() yields
         // a `Read` that pulls from the wire as bytes are requested.
-        let reader = resp.into_body().into_reader();
-        self.body = Some(Box::new(reader));
+        let mut reader: Box<dyn Read + Send> = Box::new(resp.into_body().into_reader());
+        if skip_prefix > 0 {
+            // Drain the prefix in 8 KiB chunks rather than allocating
+            // a single huge buffer for very large seek offsets.
+            let mut remaining = skip_prefix;
+            let mut buf = [0u8; 8 * 1024];
+            while remaining > 0 {
+                let want = remaining.min(buf.len() as u64) as usize;
+                let n = reader.read(&mut buf[..want])?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "HTTP 200 {}: EOF after draining {} of {skip_prefix} prefix bytes",
+                            self.uri,
+                            skip_prefix - remaining
+                        ),
+                    ));
+                }
+                remaining -= n as u64;
+            }
+        }
+        self.body = Some(reader);
         Ok(())
     }
+}
+
+/// Parsed `Content-Range: bytes <first>-<last>/<complete-or-*>`.
+///
+/// Public-but-internal: lives in the crate so the validator and the
+/// unit tests can share one parser. We deliberately do NOT export it —
+/// any future surface change shouldn't drag this representation into
+/// the public API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ByteContentRange {
+    first: u64,
+    last: u64,
+    /// `None` when the server emitted `*` for complete-length.
+    complete: Option<u64>,
+}
+
+/// Parse a `Content-Range` field value per RFC 7233 §4.2
+/// (`bytes <first>-<last>/<complete|*>`), enforcing the §4.2 validity
+/// rules on the spot:
+///
+/// * range unit MUST be `bytes` (case-insensitive — RFC 7230 §3.2.6
+///   tokens are case-insensitive; ABNF in §4.2 happens to use the
+///   lowercase literal).
+/// * `last >= first` (otherwise §4.2 "byte-range-resp ... last-byte-pos
+///   value less than its first-byte-pos" is invalid).
+/// * `complete > last` (§4.2 "complete-length value less than or equal
+///   to its last-byte-pos" is invalid).
+///
+/// Unsatisfied-range (`bytes */N`) is intentionally rejected here — it
+/// is a 416 payload, never a 206 payload, so its arrival on a 206 is
+/// itself invalid.
+fn parse_byte_content_range(s: &str) -> std::result::Result<ByteContentRange, &'static str> {
+    let s = s.trim();
+    // unit SP byte-range-resp
+    let (unit, rest) = s.split_once(' ').ok_or("missing SP after range unit")?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return Err("range unit is not 'bytes'");
+    }
+    let rest = rest.trim_start();
+    // byte-range-resp = first "-" last "/" (complete / "*")
+    // unsatisfied-range = "*/" complete  — rejected for 206.
+    if rest.starts_with('*') {
+        return Err("unsatisfied-range ('*/N') not valid on 206");
+    }
+    let (range_part, complete_part) = rest
+        .split_once('/')
+        .ok_or("missing '/' before complete-length")?;
+    let (first_s, last_s) = range_part
+        .split_once('-')
+        .ok_or("missing '-' between first-byte-pos and last-byte-pos")?;
+    let first: u64 = first_s.parse().map_err(|_| "first-byte-pos is not a u64")?;
+    let last: u64 = last_s.parse().map_err(|_| "last-byte-pos is not a u64")?;
+    if last < first {
+        return Err("last-byte-pos < first-byte-pos");
+    }
+    let complete = if complete_part == "*" {
+        None
+    } else {
+        let c: u64 = complete_part
+            .parse()
+            .map_err(|_| "complete-length is not a u64 or '*'")?;
+        if c <= last {
+            return Err("complete-length <= last-byte-pos");
+        }
+        Some(c)
+    };
+    Ok(ByteContentRange {
+        first,
+        last,
+        complete,
+    })
 }
 
 impl Read for HttpSource {
@@ -574,5 +733,283 @@ mod tests {
     fn config_already_installed_implements_error_trait() {
         let e: &dyn std::error::Error = &ConfigAlreadyInstalled;
         assert!(e.to_string().contains("already"));
+    }
+
+    // -- RFC 7233 §4.2 Content-Range parser ----------------------------------
+
+    #[test]
+    fn content_range_parses_canonical_form() {
+        let r = parse_byte_content_range("bytes 42-1233/1234").unwrap();
+        assert_eq!(
+            r,
+            ByteContentRange {
+                first: 42,
+                last: 1233,
+                complete: Some(1234),
+            }
+        );
+    }
+
+    #[test]
+    fn content_range_accepts_star_complete_length() {
+        // RFC 7233 §4.2: "An asterisk character ('*') in place of the
+        // complete-length indicates that the representation length was
+        // unknown when the header field was generated."
+        let r = parse_byte_content_range("bytes 42-1233/*").unwrap();
+        assert_eq!(r.first, 42);
+        assert_eq!(r.last, 1233);
+        assert_eq!(r.complete, None);
+    }
+
+    #[test]
+    fn content_range_accepts_full_resource_first_last() {
+        let r = parse_byte_content_range("bytes 0-0/1").unwrap();
+        assert_eq!(r.first, 0);
+        assert_eq!(r.last, 0);
+        assert_eq!(r.complete, Some(1));
+    }
+
+    #[test]
+    fn content_range_unit_is_case_insensitive() {
+        // RFC 7230 §3.2.6 tokens are case-insensitive.
+        assert!(parse_byte_content_range("BYTES 0-9/10").is_ok());
+        assert!(parse_byte_content_range("Bytes 0-9/10").is_ok());
+    }
+
+    #[test]
+    fn content_range_rejects_unknown_unit() {
+        // RFC 7233 §4.2: "If a 206 (Partial Content) response contains
+        // a Content-Range header field with a range unit (Section 2)
+        // that the recipient does not understand, the recipient MUST
+        // NOT attempt to recombine it with a stored representation."
+        assert!(parse_byte_content_range("frames 0-9/100").is_err());
+    }
+
+    #[test]
+    fn content_range_rejects_last_lt_first() {
+        // §4.2: invalid if last-byte-pos < first-byte-pos.
+        assert!(parse_byte_content_range("bytes 100-50/200").is_err());
+    }
+
+    #[test]
+    fn content_range_rejects_complete_le_last() {
+        // §4.2: invalid if complete-length <= last-byte-pos.
+        assert!(parse_byte_content_range("bytes 0-100/100").is_err());
+        assert!(parse_byte_content_range("bytes 0-100/50").is_err());
+    }
+
+    #[test]
+    fn content_range_rejects_unsatisfied_payload_on_206() {
+        // §4.2 unsatisfied-range = "*/" complete is a 416 payload, not
+        // a 206 payload — we reject it at parse time.
+        assert!(parse_byte_content_range("bytes */1234").is_err());
+    }
+
+    #[test]
+    fn content_range_rejects_malformed_strings() {
+        for bad in [
+            "",
+            "bytes",
+            "bytes 0-9",                       // missing /complete
+            "bytes 09/10",                     // missing -
+            "bytes a-9/10",                    // non-numeric first
+            "bytes 0-b/10",                    // non-numeric last
+            "bytes 0-9/x",                     // non-numeric complete
+            "bytes 18446744073709551616-0/10", // u64 overflow on first
+            "0-9/10",                          // missing unit + SP
+        ] {
+            assert!(
+                parse_byte_content_range(bad).is_err(),
+                "expected reject for {bad:?}"
+            );
+        }
+    }
+
+    // -- Local-TCP end-to-end tests ------------------------------------------
+    //
+    // These spin up a single-shot std::net::TcpListener on 127.0.0.1:0,
+    // accept N connections, hand-craft minimal HTTP/1.1 responses, and
+    // verify our HttpSource's Content-Range validator catches the
+    // bad-server cases and accepts the canonical-server cases. They do
+    // not depend on external network reachability.
+
+    use std::io::Write as _;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
+    /// Spawn a minimal HTTP/1.1 server on 127.0.0.1:0 that responds to
+    /// `HEAD` requests with `head_resp` and to `GET` requests with
+    /// `get_resp`. Each response is the literal byte string the test
+    /// supplies (status line + headers + CRLF + body, no
+    /// chunked-encoding).
+    fn spawn_server(
+        head_resp: &'static [u8],
+        get_resp: &'static [u8],
+    ) -> (String, mpsc::Receiver<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::channel::<()>();
+        thread::spawn(move || {
+            // Accept up to 4 connections so HEAD + GET (and one retry)
+            // all land. ureq may use separate connections.
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                use std::io::Read as _;
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let req = &buf[..n];
+                let resp = if req.starts_with(b"HEAD ") {
+                    head_resp
+                } else {
+                    get_resp
+                };
+                let _ = stream.write_all(resp);
+                let _ = stream.flush();
+            }
+            let _ = tx.send(());
+        });
+        (format!("http://127.0.0.1:{port}/x"), rx)
+    }
+
+    const HEAD_10B_BYTES: &[u8] = b"HTTP/1.1 200 OK\r\n\
+        Content-Length: 10\r\n\
+        Accept-Ranges: bytes\r\n\
+        Connection: close\r\n\
+        \r\n";
+
+    fn make_get_206(content_range: &str, body: &[u8]) -> Vec<u8> {
+        let mut v = format!(
+            "HTTP/1.1 206 Partial Content\r\n\
+             Content-Length: {}\r\n\
+             Content-Range: {content_range}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            body.len()
+        )
+        .into_bytes();
+        v.extend_from_slice(body);
+        v
+    }
+
+    #[test]
+    fn local_server_canonical_206_succeeds() {
+        // Static GET response: Content-Range echoes the requested
+        // open-ended `bytes=0-`, body is the full 10 B.
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 10\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+    }
+
+    #[test]
+    fn local_server_206_without_content_range_is_rejected() {
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        let err = std::io::Read::read_exact(&mut src, &mut buf).unwrap_err();
+        assert!(
+            err.to_string().contains("missing Content-Range"),
+            "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn local_server_206_with_wrong_first_pos_is_rejected() {
+        // We ask for bytes=0-; server replies with bytes 3-9/10 — that
+        // would silently misalign the demuxer.
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 7\r\n\
+            Content-Range: bytes 3-9/10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            3456789";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        let err = std::io::Read::read_exact(&mut src, &mut buf).unwrap_err();
+        assert!(
+            err.to_string().contains("first-byte-pos"),
+            "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn local_server_206_with_resource_resize_is_rejected() {
+        // HEAD said 10; 206 says complete-length 20 — origin/cache
+        // disagreement we cannot recover from in-band.
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 10\r\n\
+            Content-Range: bytes 0-9/20\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        let err = std::io::Read::read_exact(&mut src, &mut buf).unwrap_err();
+        assert!(
+            err.to_string().contains("complete-length"),
+            "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn local_server_206_with_star_complete_is_accepted() {
+        // RFC 7233 §4.2 explicitly permits `*` complete-length when
+        // the server doesn't know the total. We must accept it.
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 10\r\n\
+            Content-Range: bytes 0-9/*\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+    }
+
+    #[test]
+    fn local_server_200_after_seek_drops_prefix() {
+        // Server ignores Range entirely and serves full body with 200.
+        // We seek to byte 4 first; the driver must drain bytes 0..4
+        // before exposing byte 4 onward to the reader.
+        static GET: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        std::io::Seek::seek(&mut src, SeekFrom::Start(4)).unwrap();
+        let mut buf = [0u8; 6];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"456789");
+    }
+
+    // Silence "unused" warning when these helpers aren't all picked up
+    // — make_get_206 is a convenience the next test round may use.
+    #[allow(dead_code)]
+    fn _keep_helper() {
+        let _ = make_get_206("bytes 0-9/10", b"0123456789");
     }
 }

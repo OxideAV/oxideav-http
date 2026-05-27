@@ -56,6 +56,31 @@ once the process-wide agent has materialised. Call it before the first
 `ctx.sources.open(...)` if you need it to take effect on
 registry-dispatched opens.
 
+## Range-response validation
+
+Every 206 (Partial Content) response is validated against RFC 7233
+§4.2 before any byte is exposed to the reader:
+
+- `Content-Range` header MUST be present.
+- Range unit MUST be `bytes` (case-insensitive).
+- `first-byte-pos` MUST equal the byte position we asked for —
+  a cache / CDN that slides the start would otherwise silently
+  misalign every subsequent demuxer read.
+- `last-byte-pos >= first-byte-pos`.
+- `complete-length`, when concrete, MUST equal the `Content-Length`
+  observed at HEAD construction — a mid-stream resource resize is a
+  fatal origin/cache disagreement.
+- `last-byte-pos < complete-length`.
+- `*` complete-length is accepted (§4.2 explicitly permits it when
+  the server doesn't know the total).
+- `bytes */N` unsatisfied-range payloads are rejected on a 206 (they
+  are a 416 payload, never a 206 payload).
+
+If a server ignores the `Range` header and responds with `200 OK`
+plus the full body (§3.1 permits this), the prefix `[0, self.pos)`
+is drained in 8 KiB chunks before bytes reach the reader, so the
+demuxer's file-offset view stays consistent.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

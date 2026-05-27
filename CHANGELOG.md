@@ -25,6 +25,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RedirectAuthPolicy` variant lighting up the `agent_from` path,
   one-shot install semantics, and the `ConfigAlreadyInstalled`
   `std::error::Error` impl.
+- RFC 7233 §4.2 `Content-Range` validation on 206 responses: every 206
+  must echo a `Content-Range: bytes <first>-<last>/<complete|*>` whose
+  `first` equals the byte position we requested, whose `last >= first`,
+  whose `complete` (when concrete) equals the `Content-Length` we
+  observed at HEAD, and whose `last < complete`. Missing Content-Range,
+  non-`bytes` units, unsatisfied-range (`bytes */N`) payloads, and
+  resource-resize disagreements all fail the read with a descriptive
+  `io::Error` instead of silently misaligning the demuxer. 8 new parser
+  unit tests cover canonical form, `*` complete-length acceptance,
+  case-insensitive unit, and every §4.2 invalidity rule.
+- RFC 7233 §3.1 fallback for servers that ignore `Range` and reply 200
+  with the full body: the prefix `[0, self.pos)` is now drained in
+  8 KiB chunks before bytes are exposed to the reader, so the
+  file-offset view stays consistent with the demuxer's expectation.
+- Local-TCP end-to-end tests (`std::net::TcpListener` on
+  `127.0.0.1:0`): canonical 206, missing Content-Range, wrong
+  first-byte-pos, complete-length disagreement, `*` complete-length
+  acceptance, and 200-fallback prefix-drop. No external network
+  reachability required.
 
 ### Changed
 
