@@ -44,6 +44,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first-byte-pos, complete-length disagreement, `*` complete-length
   acceptance, and 200-fallback prefix-drop. No external network
   reachability required.
+- RFC 9110 §15.5.17 + §14.4 `416 Range Not Satisfiable` handling:
+  when the server responds 416 with a `Content-Range: bytes
+  */<complete-length>` body the driver parses out the server's
+  authoritative resource length and the resulting `io::Error`
+  surfaces BOTH the server's reported length AND the length
+  observed at HEAD construction, letting a caller distinguish
+  "asked past EOF" from "resource shrank mid-stream" (a
+  cache/origin disagreement). A 416 with no Content-Range or with
+  a malformed Content-Range still errors cleanly with a
+  status-naming message. 5 new unsatisfied-range parser unit
+  tests + 3 new local-TCP end-to-end tests (canonical 416,
+  Content-Range-less 416, malformed-Content-Range 416).
 
 ### Changed
 

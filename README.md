@@ -81,6 +81,22 @@ plus the full body (§3.1 permits this), the prefix `[0, self.pos)`
 is drained in 8 KiB chunks before bytes reach the reader, so the
 demuxer's file-offset view stays consistent.
 
+## 416 Range Not Satisfiable
+
+A 416 response is treated as a distinct error path per RFC 9110
+§15.5.17. When the server includes the `Content-Range: bytes
+*/<complete-length>` body that §14.4 SHOULDs for 416 responses,
+the parser extracts the server's authoritative resource length and
+the resulting `io::Error` surfaces BOTH the server's reported length
+AND the length observed at HEAD construction. That lets a caller
+tell "I asked past EOF" apart from "the resource shrank between the
+HEAD and the GET" — the latter is a cache/origin disagreement worth
+reporting upstream.
+
+If the 416 omits the SHOULD'd Content-Range, the error still names
+the status cleanly. If the 416 carries a malformed Content-Range,
+the parse error surfaces rather than a fabricated length.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

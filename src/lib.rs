@@ -250,7 +250,13 @@ fn agent_from(cfg: &HttpConfig) -> Agent {
         .redirect_auth_headers(match cfg.redirect_auth_policy {
             RedirectAuthPolicy::Never => ureq::config::RedirectAuthHeaders::Never,
             RedirectAuthPolicy::SameHost => ureq::config::RedirectAuthHeaders::SameHost,
-        });
+        })
+        // Inspect 4xx/5xx ourselves so we can give RFC 9110 §15.5.17 +
+        // §14.4 treatment to 416 (Range Not Satisfiable). With the
+        // status-as-error default, the response's Content-Range body is
+        // surfaced as an opaque status string and the unsatisfied-range
+        // payload is lost before our handler ever sees it.
+        .http_status_as_error(false);
     if let Some(ua) = cfg.user_agent.as_deref() {
         b = b.user_agent(ua);
     }
@@ -399,6 +405,43 @@ impl HttpSource {
             .call()
             .map_err(|e| io::Error::other(format!("HTTP GET {} {}: {e}", self.uri, range)))?;
         let status = resp.status();
+        // RFC 9110 §15.5.17: a 416 (Range Not Satisfiable) means the
+        // server has rejected our requested range. §14.4 SHOULDs a
+        // `Content-Range: bytes */<complete-length>` header in this
+        // case, naming the server's current authoritative resource
+        // length. We surface that length so the caller can distinguish
+        // "past EOF" from "resource shrank mid-stream" (the HEAD said N
+        // and a later GET reports M < self.pos).
+        if status == 416 {
+            let cr_raw = resp
+                .headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            if let Some(cr) = cr_raw.as_deref() {
+                match parse_byte_unsatisfied_range(cr) {
+                    Ok(complete) => {
+                        return Err(io::Error::other(format!(
+                            "HTTP 416 {} {}: server reports complete-length {complete} (HEAD observed {}, requested pos {})",
+                            self.uri, range, self.total_len, self.pos
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(io::Error::other(format!(
+                            "HTTP 416 {} {}: invalid Content-Range '{cr}': {e}",
+                            self.uri, range
+                        )));
+                    }
+                }
+            }
+            // §14.4 SHOULD, not MUST — a 416 with no Content-Range is
+            // unusual but legal. Still treat it as a hard error since
+            // the read can't proceed; just say so plainly.
+            return Err(io::Error::other(format!(
+                "HTTP 416 {} {}: server rejected range (no Content-Range body)",
+                self.uri, range
+            )));
+        }
         if !(status == 206 || status == 200) {
             return Err(io::Error::other(format!(
                 "HTTP GET {} {}: status {status}",
@@ -570,6 +613,35 @@ fn parse_byte_content_range(s: &str) -> std::result::Result<ByteContentRange, &'
         last,
         complete,
     })
+}
+
+/// Parse a `Content-Range: bytes */<complete-length>` field value per
+/// RFC 9110 §14.4 — the *unsatisfied-range* form a server SHOULD return
+/// alongside a 416 (Range Not Satisfiable) response (§15.5.17).
+///
+/// Returns the server's authoritative complete-length on success. The
+/// 416 status itself tells the caller the range was rejected; this
+/// parser only extracts the length value so the caller can compare it
+/// against what was observed at HEAD construction and tell whether the
+/// rejection is "past EOF" or "resource shrank mid-stream."
+///
+/// Rejects the canonical `range-resp` form (`bytes first-last/complete`)
+/// — a 416 body is the unsatisfied-range form per §14.4, never a
+/// range-resp.
+fn parse_byte_unsatisfied_range(s: &str) -> std::result::Result<u64, &'static str> {
+    let s = s.trim();
+    let (unit, rest) = s.split_once(' ').ok_or("missing SP after range unit")?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return Err("range unit is not 'bytes'");
+    }
+    let rest = rest.trim_start();
+    let complete_part = rest
+        .strip_prefix("*/")
+        .ok_or("not an unsatisfied-range ('*/N' expected)")?;
+    let complete: u64 = complete_part
+        .parse()
+        .map_err(|_| "complete-length is not a u64")?;
+    Ok(complete)
 }
 
 impl Read for HttpSource {
@@ -806,6 +878,55 @@ mod tests {
     }
 
     #[test]
+    fn unsatisfied_range_parses_canonical_form() {
+        // RFC 9110 §14.4 example: `bytes */1234`.
+        let n = parse_byte_unsatisfied_range("bytes */1234").unwrap();
+        assert_eq!(n, 1234);
+    }
+
+    #[test]
+    fn unsatisfied_range_unit_is_case_insensitive() {
+        assert_eq!(
+            parse_byte_unsatisfied_range("BYTES */47022").unwrap(),
+            47022
+        );
+        assert_eq!(
+            parse_byte_unsatisfied_range("Bytes */47022").unwrap(),
+            47022
+        );
+    }
+
+    #[test]
+    fn unsatisfied_range_rejects_unknown_unit() {
+        assert!(parse_byte_unsatisfied_range("frames */1234").is_err());
+    }
+
+    #[test]
+    fn unsatisfied_range_rejects_range_resp_form() {
+        // §14.4: a 416 body is unsatisfied-range, never the canonical
+        // range-resp form (first-last/complete).
+        assert!(parse_byte_unsatisfied_range("bytes 0-9/10").is_err());
+        assert!(parse_byte_unsatisfied_range("bytes 42-1233/1234").is_err());
+    }
+
+    #[test]
+    fn unsatisfied_range_rejects_malformed() {
+        for bad in [
+            "",
+            "bytes",
+            "bytes */",  // no digits after '*/'
+            "bytes */x", // non-numeric complete
+            "bytes /1234",
+            "*/1234", // missing unit + SP
+        ] {
+            assert!(
+                parse_byte_unsatisfied_range(bad).is_err(),
+                "expected reject for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
     fn content_range_rejects_malformed_strings() {
         for bad in [
             "",
@@ -1004,6 +1125,86 @@ mod tests {
         let mut buf = [0u8; 6];
         std::io::Read::read_exact(&mut src, &mut buf).expect("read");
         assert_eq!(&buf, b"456789");
+    }
+
+    #[test]
+    fn local_server_416_with_unsatisfied_range_surfaces_complete_length() {
+        // RFC 9110 §15.5.17 + §14.4: a 416 carries `bytes */<complete>`
+        // naming the server's authoritative current length. We seek
+        // past EOF (HEAD said 10, seek to 8, server reports current
+        // length 5 — i.e. resource shrank) and expect the error message
+        // to surface BOTH the server's reported length and the
+        // HEAD-observed length so the caller can distinguish the case.
+        static GET: &[u8] = b"HTTP/1.1 416 Range Not Satisfiable\r\n\
+            Content-Length: 0\r\n\
+            Content-Range: bytes */5\r\n\
+            Connection: close\r\n\
+            \r\n";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        // Seek to byte 8 — HEAD said 10 so this is in-bounds from our
+        // pov; the server's 416 then tells us the resource is now 5.
+        std::io::Seek::seek(&mut src, SeekFrom::Start(8)).unwrap();
+        let mut buf = [0u8; 1];
+        let err = std::io::Read::read_exact(&mut src, &mut buf).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("416"), "wrong error (no 416): {msg}");
+        assert!(
+            msg.contains("complete-length 5"),
+            "wrong error (no 'complete-length 5'): {msg}"
+        );
+        assert!(
+            msg.contains("HEAD observed 10"),
+            "wrong error (no 'HEAD observed 10'): {msg}"
+        );
+    }
+
+    #[test]
+    fn local_server_416_without_content_range_still_errors_cleanly() {
+        // §14.4 makes the Content-Range a SHOULD on 416, not a MUST. A
+        // 416 without the body still needs a clean error path that
+        // names the status.
+        static GET: &[u8] = b"HTTP/1.1 416 Range Not Satisfiable\r\n\
+            Content-Length: 0\r\n\
+            Connection: close\r\n\
+            \r\n";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        std::io::Seek::seek(&mut src, SeekFrom::Start(8)).unwrap();
+        let mut buf = [0u8; 1];
+        let err = std::io::Read::read_exact(&mut src, &mut buf).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("416"), "wrong error (no 416): {msg}");
+        assert!(
+            msg.contains("no Content-Range"),
+            "wrong error (no 'no Content-Range'): {msg}"
+        );
+    }
+
+    #[test]
+    fn local_server_416_with_invalid_content_range_reports_parse_error() {
+        // A 416 whose Content-Range is malformed — the read still
+        // fails, but the error names the parse failure rather than
+        // surfacing nonsense as a length.
+        static GET: &[u8] = b"HTTP/1.1 416 Range Not Satisfiable\r\n\
+            Content-Length: 0\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n";
+        // 'bytes 0-9/10' is a range-resp form, not unsatisfied-range —
+        // §14.4 says the 416 body should be `*/N`. Anything else is a
+        // server bug; we surface the parse error.
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        std::io::Seek::seek(&mut src, SeekFrom::Start(8)).unwrap();
+        let mut buf = [0u8; 1];
+        let err = std::io::Read::read_exact(&mut src, &mut buf).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("416"), "wrong error (no 416): {msg}");
+        assert!(
+            msg.contains("invalid Content-Range"),
+            "wrong error (no 'invalid Content-Range'): {msg}"
+        );
     }
 
     // Silence "unused" warning when these helpers aren't all picked up
