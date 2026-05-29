@@ -56,6 +56,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status-naming message. 5 new unsatisfied-range parser unit
   tests + 3 new local-TCP end-to-end tests (canonical 416,
   Content-Range-less 416, malformed-Content-Range 416).
+- RFC 9110 §13.1.5 `If-Range` strong-validator path: at HEAD the
+  driver now captures an `ETag` (only when strong — §8.8.3 weak
+  `W/`-prefixed tags are rejected per §13.1.5's "MUST NOT generate
+  ... an entity tag that is marked as weak") or, failing that, a
+  `Last-Modified` value the §8.8.2.2 "Date - Last-Modified >= 1 s"
+  rule promotes from implicitly-weak to strong. The validator is
+  replayed as `If-Range: <wire-form>` on every subsequent
+  `Range: bytes=N-` GET so that a mid-stream representation change
+  short-circuits to 200 (full body of the NEW representation) —
+  which the driver then surfaces as a fatal `io::Error` naming
+  "If-Range validator did not match — representation changed since
+  HEAD" rather than silently re-anchoring the byte offset. New
+  parsers (`parse_entity_tag` per §8.8.3 ABNF, `parse_imf_fixdate`
+  per §5.6.7 IMF-fixdate, `derive_strong_validator`) carry 12 new
+  unit tests covering strong/weak ETag distinction, case-sensitive
+  `W/` weakness marker, IMF-fixdate acceptance and rfc850/asctime
+  rejection, the 1-second §8.8.2.2 boundary, and ETag-first /
+  Last-Modified-fallback / no-validator precedence. 4 new local-TCP
+  end-to-end tests verify the wire-level `If-Range` header is
+  emitted for strong ETags, suppressed for weak ETags, fatally
+  errored when a `If-Range` GET drops to 200, and that the §3.1
+  drain-prefix path remains intact when no validator was sent.
 
 ### Changed
 

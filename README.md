@@ -97,6 +97,32 @@ If the 416 omits the SHOULD'd Content-Range, the error still names
 the status cleanly. If the 416 carries a malformed Content-Range,
 the parse error surfaces rather than a fabricated length.
 
+## Mid-stream mutation detection
+
+The driver implements RFC 9110 §13.1.5 `If-Range` to catch the case
+where a CDN, cache, or origin replaces the resource between the
+opening `HEAD` and a later `Range` GET. At `HEAD` we capture a
+*strong* validator:
+
+- An `ETag` is taken as-is when it lacks the `W/` weakness prefix
+  (§8.8.3 — weak entity-tags are MUST-NOT for `If-Range` per
+  §13.1.5).
+- Failing that, `Last-Modified` is taken only when the companion
+  `Date` header is at least one second after it (§8.8.2.2's
+  promotion rule from "implicitly weak" to "strong").
+- Otherwise no validator is captured and the read path issues
+  plain `Range` GETs (matching pre-r186 behaviour).
+
+Every range GET that has a captured validator carries
+`If-Range: <wire-form>`. Per §13.1.5 the server then either
+satisfies the range normally (`206 Partial Content`) or responds
+with a full `200 OK` for the *new* representation. The latter is
+treated as a fatal `io::Error` naming "If-Range validator did not
+match — representation changed since HEAD" so a downstream demuxer
+never silently re-anchors against a different resource. When no
+`If-Range` was sent (no strong validator at HEAD), the §3.1
+prefix-drain fallback still applies unchanged.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

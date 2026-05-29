@@ -37,6 +37,19 @@
 //!     .build();
 //! oxideav_http::install_default_config(cfg).ok();
 //! ```
+//!
+//! ## Mid-stream mutation detection (RFC 9110 §13.1.5)
+//!
+//! When the origin's `HEAD` reply carries a STRONG validator (an ETag
+//! without the `W/` weakness prefix, or a `Last-Modified` whose
+//! companion `Date` header is at least one second later — the §8.8.2.2
+//! promotion rule), every subsequent `Range: bytes=N-` GET is sent
+//! with `If-Range: <validator>`. Per §13.1.5 the server then EITHER
+//! satisfies the range (`206 Partial Content` — happy path) OR ignores
+//! `Range` and returns the full new representation (`200 OK`). The
+//! driver treats the latter as a fatal mid-stream-mutation error
+//! rather than silently re-anchoring the byte offset against a
+//! different resource.
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::OnceLock;
@@ -313,6 +326,35 @@ fn agent() -> &'static Agent {
 // HttpSource
 // ---------------------------------------------------------------------------
 
+/// Strong validator captured at HEAD construction, used as the
+/// `If-Range` value on subsequent `Range` GETs per RFC 9110 §13.1.5.
+///
+/// Per §13.1.5 a client MUST NOT send a weak entity tag in `If-Range`,
+/// and a `Last-Modified`-based `If-Range` is only legitimate when the
+/// `Last-Modified` value is a strong validator per §8.8.2.2 (here:
+/// the HEAD response's `Date` is at least one second after its
+/// `Last-Modified`). When neither condition holds we record `None`
+/// and the GET path goes out without `If-Range`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StrongValidator {
+    /// `ETag: "<opaque>"` — already verified strong (no `W/` prefix).
+    /// Stored as the wire form (with surrounding double quotes).
+    Etag(String),
+    /// `Last-Modified: <HTTP-date>` deemed strong by the §8.8.2.2
+    /// "Date - Last-Modified >= 1s" rule. Stored as the wire form.
+    LastModified(String),
+}
+
+impl StrongValidator {
+    /// Render as a complete `If-Range` field value.
+    fn as_if_range(&self) -> &str {
+        match self {
+            StrongValidator::Etag(s) => s,
+            StrongValidator::LastModified(s) => s,
+        }
+    }
+}
+
 /// `ReadSeek` over an HTTP/HTTPS resource, using `Range` requests.
 pub struct HttpSource {
     uri: String,
@@ -320,6 +362,11 @@ pub struct HttpSource {
     pos: u64,
     /// Per-source agent. When `None` we use the shared default agent.
     agent: Option<Agent>,
+    /// Strong validator captured at HEAD, replayed as `If-Range` on
+    /// every subsequent range GET so the server replaces a stale
+    /// 206 with a 200 — which we surface as a fatal mid-stream
+    /// mutation rather than silently re-anchor.
+    validator: Option<StrongValidator>,
     /// Active response body for the current contiguous read run, if any.
     body: Option<Box<dyn Read + Send>>,
 }
@@ -371,11 +418,32 @@ impl HttpSource {
                 "HTTP HEAD {uri}: server does not advertise byte ranges (Accept-Ranges: '{accept_ranges}')"
             )));
         }
+        // Capture a STRONG validator per RFC 9110 §13.1.5 so subsequent
+        // range GETs can carry `If-Range: <validator>` and surface a
+        // mid-stream mutation cleanly. ETag takes precedence (§8.8.3
+        // is "more reliable for validation than a modification date"
+        // and the strong/weak distinction is grammatical); fall back to
+        // Last-Modified only when §8.8.2.2's "Date - Last-Modified >= 1s"
+        // rule promotes it from implicitly-weak to strong.
+        let etag_raw = headers
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim);
+        let last_modified = headers
+            .get("last-modified")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim);
+        let date_hdr = headers
+            .get("date")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim);
+        let validator = derive_strong_validator(etag_raw, last_modified, date_hdr);
         Ok(Self {
             uri: uri.to_owned(),
             total_len,
             pos: 0,
             agent: scoped,
+            validator,
             body: None,
         })
     }
@@ -398,10 +466,18 @@ impl HttpSource {
             return Ok(());
         }
         let range = format!("bytes={}-", self.pos);
-        let resp = self
-            .agent_ref()
-            .get(&self.uri)
-            .header("Range", &range)
+        // RFC 9110 §13.1.5: when we have a strong validator from HEAD,
+        // attach `If-Range: <validator>` so a mid-stream mutation flips
+        // the response from 206 to 200 (the §13.1.5 short-circuit) and
+        // we can surface it as a hard error below rather than silently
+        // re-anchor the byte offset against a different representation.
+        let if_range = self.validator.as_ref().map(|v| v.as_if_range().to_owned());
+        let sent_if_range = if_range.is_some();
+        let mut req = self.agent_ref().get(&self.uri).header("Range", &range);
+        if let Some(ref v) = if_range {
+            req = req.header("If-Range", v.as_str());
+        }
+        let resp = req
             .call()
             .map_err(|e| io::Error::other(format!("HTTP GET {} {}: {e}", self.uri, range)))?;
         let status = resp.status();
@@ -448,13 +524,28 @@ impl HttpSource {
                 self.uri, range
             )));
         }
+        // RFC 9110 §13.1.5: when we sent `If-Range`, a 200 means the
+        // server's current validator did NOT match ours — i.e. the
+        // representation has been replaced since HEAD. Silently
+        // resuming on the new bytes would re-anchor every later
+        // file-offset view against a different resource; that's a
+        // misalignment bug, not a soft fallback. Surface as fatal.
+        if status == 200 && sent_if_range {
+            return Err(io::Error::other(format!(
+                "HTTP 200 {} {}: If-Range validator did not match — \
+                 representation changed since HEAD (origin/cache mutation)",
+                self.uri, range
+            )));
+        }
         let pos = self.pos;
         let total_len = self.total_len;
         // Per RFC 7233 §3.1, a server that does not support (or chooses
         // to ignore) Range MAY answer a range request with a full 200
         // response. In that case we must drop the prefix [0, self.pos)
         // before exposing bytes to the reader so the demuxer keeps a
-        // consistent file-offset view.
+        // consistent file-offset view. We only walk this branch when
+        // we did NOT send If-Range; a 200 with If-Range is the
+        // mid-stream-mutation case handled above.
         let skip_prefix = if status == 200 { pos } else { 0 };
         if status == 206 {
             // RFC 7233 §4.2: validate the server's Content-Range echo
@@ -642,6 +733,155 @@ fn parse_byte_unsatisfied_range(s: &str) -> std::result::Result<u64, &'static st
         .parse()
         .map_err(|_| "complete-length is not a u64")?;
     Ok(complete)
+}
+
+/// Parse an `ETag` field value per RFC 9110 §8.8.3 grammar:
+///
+/// ```text
+/// entity-tag = [ weak ] opaque-tag
+/// weak       = %s"W/"
+/// opaque-tag = DQUOTE *etagc DQUOTE
+/// etagc      = %x21 / %x23-7E / obs-text
+/// ```
+///
+/// Returns `Some((is_weak, full_wire_form))` on a syntactically valid
+/// entity-tag, `None` on anything else (an unset or malformed value
+/// must not surface as a usable validator).
+///
+/// `full_wire_form` is the input including the surrounding DQUOTEs and
+/// the `W/` prefix if any — what we'd echo back in `If-Range`.
+fn parse_entity_tag(s: &str) -> Option<(bool, String)> {
+    let s = s.trim();
+    // `weak` is case-sensitive `W/` per §8.8.3 (`%s"W/"`).
+    let (is_weak, body) = if let Some(rest) = s.strip_prefix("W/") {
+        (true, rest)
+    } else {
+        (false, s)
+    };
+    let body = body.strip_prefix('"')?;
+    let body = body.strip_suffix('"')?;
+    // §8.8.3 etagc = %x21 / %x23-7E / obs-text. We accept obs-text
+    // (%x80-FF) too, since RFC 9110 §5.5 permits it as a deprecated
+    // historical byte class.
+    for b in body.bytes() {
+        let ok = b == 0x21 || (0x23..=0x7E).contains(&b) || b >= 0x80;
+        if !ok {
+            return None;
+        }
+    }
+    Some((is_weak, s.to_owned()))
+}
+
+/// Parse an HTTP-date per RFC 9110 §5.6.7 / §IMF-fixdate into a
+/// (year, month, day, hour, minute, second) tuple. Only IMF-fixdate
+/// (`Sun, 06 Nov 1994 08:49:37 GMT`) is supported — §5.6.7 says senders
+/// MUST emit IMF-fixdate; the obsolete `rfc850` and `asctime` forms are
+/// "MUST accept" on the receiving side but we use this parser only for
+/// our own strong-validator promotion test, where IMF-fixdate is what
+/// every modern origin emits. A None means "couldn't promote to strong"
+/// which is the safe outcome.
+fn parse_imf_fixdate(s: &str) -> Option<(i32, u8, u8, u8, u8, u8)> {
+    // Expect: "Wkd, DD Mon YYYY HH:MM:SS GMT"
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    if bytes.len() < 29 {
+        return None;
+    }
+    // bytes[3] = ',', bytes[4] = ' '
+    if bytes[3] != b',' || bytes[4] != b' ' {
+        return None;
+    }
+    let day: u8 = s.get(5..7)?.parse().ok()?;
+    if bytes[7] != b' ' {
+        return None;
+    }
+    let mon = match &s[8..11] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    if bytes[11] != b' ' {
+        return None;
+    }
+    let year: i32 = s.get(12..16)?.parse().ok()?;
+    if bytes[16] != b' ' {
+        return None;
+    }
+    let hour: u8 = s.get(17..19)?.parse().ok()?;
+    if bytes[19] != b':' {
+        return None;
+    }
+    let minute: u8 = s.get(20..22)?.parse().ok()?;
+    if bytes[22] != b':' {
+        return None;
+    }
+    let second: u8 = s.get(23..25)?.parse().ok()?;
+    if &s[25..] != " GMT" {
+        return None;
+    }
+    Some((year, mon, day, hour, minute, second))
+}
+
+/// Convert an IMF-fixdate (already in UTC per §5.6.7 "GMT") into a
+/// strictly-monotonic 64-bit second count from a fixed epoch. Used only
+/// for the §8.8.2.2 "Date >= Last-Modified + 1 s" comparison, so any
+/// epoch that yields a total ordering on real-world HTTP dates is fine.
+/// We pick (year-2000)*31_557_600 + ... — close enough for the
+/// strict-greater test; not used as a wall-clock value.
+fn imf_seconds(d: (i32, u8, u8, u8, u8, u8)) -> i64 {
+    let (y, mo, da, h, mi, s) = d;
+    // Cumulative days at start of month, Jan=0..Dec=334 (non-leap),
+    // good enough for ordering within the same year — across years
+    // the 365-day step dominates.
+    const CUM: [u16; 13] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365];
+    let day_of_year = CUM[(mo - 1) as usize] as i64 + (da as i64 - 1);
+    let day_index = (y as i64 - 2000) * 365 + day_of_year;
+    day_index * 86_400 + (h as i64) * 3_600 + (mi as i64) * 60 + s as i64
+}
+
+/// Decide which validator (if any) we may use as a strong `If-Range`
+/// value per RFC 9110 §13.1.5 + §8.8.2.2 + §8.8.3.
+///
+/// Returns `Some(StrongValidator::Etag(_))` when the HEAD's `ETag` is a
+/// syntactically valid strong entity-tag (no `W/` prefix). Otherwise
+/// returns `Some(StrongValidator::LastModified(_))` only when both
+/// `Last-Modified` and `Date` parse as IMF-fixdate and the §8.8.2.2
+/// promotion rule holds (`Date >= Last-Modified + 1 second`). Returns
+/// `None` otherwise — the read path then issues plain Range GETs with
+/// no `If-Range`.
+fn derive_strong_validator(
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+    date: Option<&str>,
+) -> Option<StrongValidator> {
+    if let Some(raw) = etag {
+        if let Some((is_weak, wire)) = parse_entity_tag(raw) {
+            if !is_weak {
+                return Some(StrongValidator::Etag(wire));
+            }
+        }
+    }
+    if let (Some(lm), Some(dt)) = (last_modified, date) {
+        if let (Some(lm_p), Some(dt_p)) = (parse_imf_fixdate(lm), parse_imf_fixdate(dt)) {
+            // §8.8.2.2: promotion requires Date strictly greater than
+            // Last-Modified (at 1-second resolution). `dt > lm` is the
+            // clippy-idiomatic spelling of `dt >= lm + 1` on integers.
+            if imf_seconds(dt_p) > imf_seconds(lm_p) {
+                return Some(StrongValidator::LastModified(lm.to_owned()));
+            }
+        }
+    }
+    None
 }
 
 impl Read for HttpSource {
@@ -1212,5 +1452,297 @@ mod tests {
     #[allow(dead_code)]
     fn _keep_helper() {
         let _ = make_get_206("bytes 0-9/10", b"0123456789");
+    }
+
+    // -- RFC 9110 §13.1.5 If-Range strong-validator path ---------------------
+
+    #[test]
+    fn entity_tag_parses_strong_tag() {
+        let (weak, wire) = parse_entity_tag("\"xyzzy\"").unwrap();
+        assert!(!weak);
+        assert_eq!(wire, "\"xyzzy\"");
+    }
+
+    #[test]
+    fn entity_tag_parses_weak_tag() {
+        let (weak, wire) = parse_entity_tag("W/\"xyzzy\"").unwrap();
+        assert!(weak);
+        assert_eq!(wire, "W/\"xyzzy\"");
+    }
+
+    #[test]
+    fn entity_tag_parses_empty_opaque() {
+        // §8.8.3 example: ETag: ""
+        let (weak, wire) = parse_entity_tag("\"\"").unwrap();
+        assert!(!weak);
+        assert_eq!(wire, "\"\"");
+    }
+
+    #[test]
+    fn entity_tag_rejects_unquoted_value() {
+        // The grammar requires DQUOTE-wrapped opaque-tag.
+        assert!(parse_entity_tag("xyzzy").is_none());
+        assert!(parse_entity_tag("W/xyzzy").is_none());
+    }
+
+    #[test]
+    fn entity_tag_weak_marker_is_case_sensitive() {
+        // §8.8.3: weak = %s"W/" — case-sensitive. A lowercase w/ is
+        // not a weakness indicator; it becomes part of the opaque-tag
+        // which then fails the DQUOTE-wrap test.
+        assert!(parse_entity_tag("w/\"xyzzy\"").is_none());
+    }
+
+    #[test]
+    fn entity_tag_rejects_disallowed_inner_bytes() {
+        // etagc forbids DQUOTE (0x22) and most controls.
+        assert!(parse_entity_tag("\"hello\"world\"").is_none());
+        assert!(parse_entity_tag("\"tab\there\"").is_none()); // 0x09
+    }
+
+    #[test]
+    fn imf_fixdate_parses_canonical_example() {
+        // RFC 9110 §5.6.7 canonical form.
+        let d = parse_imf_fixdate("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+        assert_eq!(d, (1994, 11, 6, 8, 49, 37));
+    }
+
+    #[test]
+    fn imf_fixdate_rejects_non_imf_forms() {
+        // Obsolete rfc850 and asctime forms — we only need to parse
+        // IMF-fixdate for the strong-validator promotion test.
+        assert!(parse_imf_fixdate("Sunday, 06-Nov-94 08:49:37 GMT").is_none());
+        assert!(parse_imf_fixdate("Sun Nov  6 08:49:37 1994").is_none());
+        // Missing GMT suffix.
+        assert!(parse_imf_fixdate("Sun, 06 Nov 1994 08:49:37").is_none());
+        // Bogus month name.
+        assert!(parse_imf_fixdate("Sun, 06 Foo 1994 08:49:37 GMT").is_none());
+    }
+
+    #[test]
+    fn imf_seconds_orders_within_one_second_correctly() {
+        // §8.8.2.2 needs strict-greater-than-or-equal at 1-second
+        // resolution. Confirm the ordering primitive supports that.
+        let lm = parse_imf_fixdate("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+        let dt_eq = parse_imf_fixdate("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+        let dt_p1 = parse_imf_fixdate("Sun, 06 Nov 1994 08:49:38 GMT").unwrap();
+        let dt_m1 = parse_imf_fixdate("Sun, 06 Nov 1994 08:49:36 GMT").unwrap();
+        assert!(imf_seconds(dt_eq) == imf_seconds(lm));
+        assert!(imf_seconds(dt_p1) == imf_seconds(lm) + 1);
+        assert!(imf_seconds(dt_m1) == imf_seconds(lm) - 1);
+    }
+
+    #[test]
+    fn derive_strong_validator_prefers_strong_etag() {
+        let v = derive_strong_validator(
+            Some("\"xyz\""),
+            Some("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
+        assert_eq!(v, Some(StrongValidator::Etag("\"xyz\"".into())));
+    }
+
+    #[test]
+    fn derive_strong_validator_skips_weak_etag_falls_to_strong_last_modified() {
+        // Weak ETag → not usable for If-Range. Last-Modified is
+        // promotable because Date is 5 s after it.
+        let v = derive_strong_validator(
+            Some("W/\"xyz\""),
+            Some("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some("Sun, 06 Nov 1994 08:49:42 GMT"),
+        );
+        assert_eq!(
+            v,
+            Some(StrongValidator::LastModified(
+                "Sun, 06 Nov 1994 08:49:37 GMT".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn derive_strong_validator_rejects_lm_when_date_within_one_second() {
+        // Date == Last-Modified is NOT strong per §8.8.2.2 — needs at
+        // least 1 s of separation. The result must be None (we fall
+        // back to issuing the GET without If-Range).
+        let v = derive_strong_validator(
+            None,
+            Some("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
+        assert_eq!(v, None);
+    }
+
+    #[test]
+    fn derive_strong_validator_rejects_lm_without_date() {
+        // §8.8.2.2 promotion needs both timestamps — without Date we
+        // can't reason about clock skew, so stay weak (= None).
+        let v = derive_strong_validator(None, Some("Sun, 06 Nov 1994 08:49:37 GMT"), None);
+        assert_eq!(v, None);
+    }
+
+    #[test]
+    fn derive_strong_validator_handles_missing_headers() {
+        assert_eq!(derive_strong_validator(None, None, None), None);
+    }
+
+    #[test]
+    fn derive_strong_validator_skips_malformed_etag_falls_through() {
+        // A malformed ETag is treated as absent — try Last-Modified.
+        let v = derive_strong_validator(
+            Some("not-quoted"),
+            Some("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some("Sun, 06 Nov 1994 08:49:42 GMT"),
+        );
+        assert_eq!(
+            v,
+            Some(StrongValidator::LastModified(
+                "Sun, 06 Nov 1994 08:49:37 GMT".into()
+            ))
+        );
+    }
+
+    /// Variant of `spawn_server` that captures the GET request bytes
+    /// in a channel so the test can verify our `If-Range` field made
+    /// it onto the wire exactly as expected.
+    fn spawn_server_capturing_get(
+        head_resp: &'static [u8],
+        get_resp: &'static [u8],
+    ) -> (String, mpsc::Receiver<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                use std::io::Read as _;
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let req = &buf[..n];
+                let resp = if req.starts_with(b"HEAD ") {
+                    head_resp
+                } else {
+                    // GET — record the full request bytes so the test
+                    // can grep for If-Range presence.
+                    let _ = tx.send(req.to_vec());
+                    get_resp
+                };
+                let _ = stream.write_all(resp);
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}/x"), rx)
+    }
+
+    /// HEAD response that supplies a strong ETag so the driver will
+    /// elect to send `If-Range: "v1"` on the next GET.
+    const HEAD_10B_WITH_STRONG_ETAG: &[u8] = b"HTTP/1.1 200 OK\r\n\
+        Content-Length: 10\r\n\
+        Accept-Ranges: bytes\r\n\
+        ETag: \"v1\"\r\n\
+        Connection: close\r\n\
+        \r\n";
+
+    #[test]
+    fn local_server_strong_etag_emits_if_range_header_on_get() {
+        // Server replies 206 normally; we just need to confirm the
+        // outgoing GET request line carried `If-Range: "v1"`.
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 10\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, captured) = spawn_server_capturing_get(HEAD_10B_WITH_STRONG_ETAG, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        let req = captured.recv().expect("captured GET request");
+        let s = String::from_utf8_lossy(&req);
+        assert!(
+            s.to_ascii_lowercase().contains("if-range: \"v1\""),
+            "GET did not carry If-Range; got:\n{s}"
+        );
+    }
+
+    /// HEAD response with a weak ETag and no Last-Modified — driver
+    /// must not invent a validator.
+    const HEAD_10B_WITH_WEAK_ETAG: &[u8] = b"HTTP/1.1 200 OK\r\n\
+        Content-Length: 10\r\n\
+        Accept-Ranges: bytes\r\n\
+        ETag: W/\"v1\"\r\n\
+        Connection: close\r\n\
+        \r\n";
+
+    #[test]
+    fn local_server_weak_etag_does_not_emit_if_range_header() {
+        // §13.1.5: "A client MUST NOT generate an If-Range header
+        // field containing an entity tag that is marked as weak."
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 10\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, captured) = spawn_server_capturing_get(HEAD_10B_WITH_WEAK_ETAG, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        let req = captured.recv().expect("captured GET request");
+        let s = String::from_utf8_lossy(&req);
+        assert!(
+            !s.to_ascii_lowercase().contains("if-range:"),
+            "GET unexpectedly carried If-Range with a weak ETag; got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn local_server_200_with_if_range_set_is_fatal_mutation() {
+        // §13.1.5 short-circuit: when the validator we sent does NOT
+        // match, the server omits the Range honour and sends 200 with
+        // the full new representation. Our driver must surface that
+        // as a hard error rather than silently re-anchoring the byte
+        // offset against a different resource.
+        static GET: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            ABCDEFGHIJ";
+        let (uri, _captured) = spawn_server_capturing_get(HEAD_10B_WITH_STRONG_ETAG, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        let err = std::io::Read::read_exact(&mut src, &mut buf).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("If-Range"),
+            "wrong error (no If-Range mention): {msg}"
+        );
+        assert!(
+            msg.contains("changed since HEAD"),
+            "wrong error (no mutation phrasing): {msg}"
+        );
+    }
+
+    #[test]
+    fn local_server_no_validator_still_drains_prefix_on_200() {
+        // Sanity: when HEAD supplies no usable validator, we did NOT
+        // send If-Range, so the §3.1 "server ignores Range, sends 200"
+        // soft-fallback (drain prefix) still works. This confirms we
+        // did not regress the existing path.
+        static GET: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        std::io::Seek::seek(&mut src, SeekFrom::Start(4)).unwrap();
+        let mut buf = [0u8; 6];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"456789");
     }
 }
