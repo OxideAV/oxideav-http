@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-http/compare/v0.0.6...v0.0.7) - 2026-05-29
+
+### Other
+
+- capture strong validator at HEAD, surface 200 as mid-stream mutation (RFC 9110 §13.1.5)
+- surface server-reported complete-length on Range Not Satisfiable (RFC 9110 §15.5.17 + §14.4)
+- validate Content-Range on 206, drain prefix on 200 (RFC 7233 §3.1/§4.2)
+- HttpConfig + install_default_config + open_with_config
+
 ### Added
 
 - `HttpConfig` + `HttpConfigBuilder` policy struct for the underlying
