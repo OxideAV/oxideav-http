@@ -13,6 +13,12 @@ homepage = "https://github.com/OxideAV/oxideav-http"
 keywords = ["multimedia", "http", "streaming", "io", "pure-rust"]
 categories = ["multimedia", "network-programming"]
 
+[features]
+# Expose internal header parsers to the cargo-fuzz harness in `fuzz/`.
+# Not part of the stable surface; published consumers should leave this
+# off.
+fuzz = []
+
 [dependencies]
 oxideav-core = "0.1"
 oxideav-source = "0.1"

@@ -97,6 +97,30 @@ If the 416 omits the SHOULD'd Content-Range, the error still names
 the status cleanly. If the 416 carries a malformed Content-Range,
 the parse error surfaces rather than a fabricated length.
 
+## RFC 9110 §8.6 Content-Length sanity
+
+Beyond the §13.1.5 strong-validator path (below), the driver
+cross-checks the GET-time `Content-Length` against §8.6's invariants:
+
+- On a 200-fallback (server ignored `Range` and shipped the full
+  body per RFC 7233 §3.1), the GET's `Content-Length` — when present
+  — MUST equal the `Content-Length` observed at HEAD. §8.6 says
+  "a server MUST NOT send Content-Length in [a HEAD] response
+  unless its field value equals the decimal number of octets that
+  would have been sent in the content of a response if the same
+  request had used the GET method." A different value is a
+  mid-stream resource resize disguised as a soft-fallback; surfacing
+  it stops the demuxer from draining a now-wrong-sized prefix and
+  reading short.
+- On a 206, the GET's `Content-Length` (when present) MUST equal
+  the byte span implied by `Content-Range: bytes <first>-<last>/N`
+  (i.e. `last - first + 1`). A mismatch is either a server bug or a
+  multipart/byteranges body (which we never request); either way
+  it would let the reader drift past the satisfied range silently.
+- Both checks are skipped silently when the GET reply omits
+  `Content-Length` (§8.6 makes it a SHOULD, not a MUST, outside
+  specific cases).
+
 ## Mid-stream mutation detection
 
 The driver implements RFC 9110 §13.1.5 `If-Range` to catch the case
@@ -122,6 +146,24 @@ match — representation changed since HEAD" so a downstream demuxer
 never silently re-anchors against a different resource. When no
 `If-Range` was sent (no strong validator at HEAD), the §3.1
 prefix-drain fallback still applies unchanged.
+
+## Fuzzing
+
+`fuzz/` carries a cargo-fuzz harness (`parse_headers`) that drives
+every internal response-header parser used by the source driver —
+`parse_byte_content_range` (RFC 7233 §4.2 / RFC 9110 §14.4),
+`parse_byte_unsatisfied_range` (§14.4), `parse_entity_tag` (§8.8.3),
+`parse_imf_fixdate` (§5.6.7), and the composite
+`derive_strong_validator` (§13.1.5 + §8.8.2.2 + §8.8.3). The harness
+reaches the parsers through a `#[doc(hidden)] pub mod __fuzz`
+re-export gated on the `fuzz` cargo feature, so the stable public
+surface is unchanged when the crate is consumed normally.
+
+```sh
+cargo +nightly fuzz run --fuzz-dir fuzz parse_headers
+```
+
+A small seed corpus lives under `fuzz/corpus/parse_headers/`.
 
 ## License
 

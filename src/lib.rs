@@ -539,6 +539,19 @@ impl HttpSource {
         }
         let pos = self.pos;
         let total_len = self.total_len;
+        // RFC 9110 §8.6: "a server MUST NOT send Content-Length in [a
+        // HEAD] response unless its field value equals the decimal
+        // number of octets that would have been sent in the content of
+        // a response if the same request had used the GET method."
+        // So a 200-fallback (full-body GET, §3.1) whose Content-Length
+        // contradicts the HEAD-observed total is a resource resize we
+        // cannot recover from in-band — surface as a hard error rather
+        // than drain a now-wrong-sized prefix and read short.
+        let get_content_length = resp
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
         // Per RFC 7233 §3.1, a server that does not support (or chooses
         // to ignore) Range MAY answer a range request with a full 200
         // response. In that case we must drop the prefix [0, self.pos)
@@ -547,6 +560,17 @@ impl HttpSource {
         // we did NOT send If-Range; a 200 with If-Range is the
         // mid-stream-mutation case handled above.
         let skip_prefix = if status == 200 { pos } else { 0 };
+        if status == 200 {
+            if let Some(cl) = get_content_length {
+                if cl != total_len {
+                    return Err(io::Error::other(format!(
+                        "HTTP 200 {} {}: Content-Length {cl} != HEAD-observed total {total_len} \
+                         (RFC 9110 §8.6 — resource resized between HEAD and GET)",
+                        self.uri, range
+                    )));
+                }
+            }
+        }
         if status == 206 {
             // RFC 7233 §4.2: validate the server's Content-Range echo
             // covers what we asked for and is self-consistent. A 206
@@ -604,6 +628,25 @@ impl HttpSource {
                     "HTTP 206 {} {}: Content-Range last-byte-pos {} >= total {}",
                     self.uri, range, parsed.last, total_len
                 )));
+            }
+            // RFC 9110 §8.6: when a 206 carries Content-Length, it MUST
+            // be the byte count of the body actually being sent — i.e.
+            // for a single-range 206 (the only form we ask for), it
+            // equals `last - first + 1`. A mismatch is either a
+            // multipart/byteranges body (we never request multi-range,
+            // and Content-Type would be `multipart/byteranges` not the
+            // raw representation type) or an outright framing bug;
+            // either way the demuxer's byte-offset view will drift if
+            // we proceed.
+            if let Some(cl) = get_content_length {
+                let expected = parsed.last - parsed.first + 1;
+                if cl != expected {
+                    return Err(io::Error::other(format!(
+                        "HTTP 206 {} {}: Content-Length {cl} != Content-Range span {expected} \
+                         (RFC 9110 §8.6)",
+                        self.uri, range
+                    )));
+                }
             }
         }
         // ureq 3: Body owns the stream; into_body().into_reader() yields
@@ -935,6 +978,42 @@ fn add_signed(base: u64, delta: i64) -> io::Result<u64> {
     } else {
         base.checked_sub(delta.unsigned_abs())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek before start"))
+    }
+}
+
+/// Header-parser wrappers exposed for the cargo-fuzz harness under
+/// `fuzz/`. Not part of the stable public surface; gated behind the
+/// `fuzz` cargo feature so the published artefact carries the same
+/// crate boundary it always had.
+///
+/// The wrappers return `bool` (parse succeeded vs not) — the fuzz
+/// contract under test is that none of these parsers panic on any
+/// byte string, not that any particular byte string parses.
+#[cfg(feature = "fuzz")]
+#[doc(hidden)]
+pub mod __fuzz {
+    /// Fuzz-only wrapper for [`super::parse_byte_content_range`].
+    pub fn parse_byte_content_range(s: &str) -> bool {
+        super::parse_byte_content_range(s).is_ok()
+    }
+    /// Fuzz-only wrapper for [`super::parse_byte_unsatisfied_range`].
+    pub fn parse_byte_unsatisfied_range(s: &str) -> bool {
+        super::parse_byte_unsatisfied_range(s).is_ok()
+    }
+    /// Fuzz-only wrapper for [`super::parse_entity_tag`].
+    pub fn parse_entity_tag(s: &str) -> bool {
+        super::parse_entity_tag(s).is_some()
+    }
+    /// Fuzz-only wrapper for [`super::parse_imf_fixdate`].
+    pub fn parse_imf_fixdate(s: &str) -> bool {
+        super::parse_imf_fixdate(s).is_some()
+    }
+    /// Fuzz-only wrapper for [`super::derive_strong_validator`]. The
+    /// caller splits the input on NUL bytes into up to three optional
+    /// header values (etag, last-modified, date) so the fuzzer can
+    /// drive all 8 input-presence combinations.
+    pub fn derive_strong_validator(etag: Option<&str>, lm: Option<&str>, date: Option<&str>) {
+        let _ = super::derive_strong_validator(etag, lm, date);
     }
 }
 
@@ -1744,5 +1823,111 @@ mod tests {
         let mut buf = [0u8; 6];
         std::io::Read::read_exact(&mut src, &mut buf).expect("read");
         assert_eq!(&buf, b"456789");
+    }
+
+    // -- RFC 9110 §8.6 Content-Length sanity ---------------------------------
+
+    #[test]
+    fn local_server_200_fallback_content_length_mismatch_is_fatal() {
+        // §8.6: HEAD's Content-Length MUST equal what a GET would have
+        // sent. So a 200-fallback (server ignored Range, served full
+        // body) carrying a Content-Length different from the HEAD's is
+        // a mid-stream resize disguised as a §3.1 soft-fallback. The
+        // demuxer would drain a now-wrong-sized prefix and read short;
+        // surface as a hard error instead.
+        //
+        // HEAD says 10 bytes, GET says 5 — the body actually shipped is
+        // 5 bytes so this is also a real wire condition (not just a
+        // header lie).
+        static GET: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 5\r\n\
+            Connection: close\r\n\
+            \r\n\
+            01234";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        let err = std::io::Read::read_exact(&mut src, &mut buf).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Content-Length 5"),
+            "wrong error (no 'Content-Length 5'): {msg}"
+        );
+        assert!(
+            msg.contains("HEAD-observed total 10"),
+            "wrong error (no HEAD-observed mention): {msg}"
+        );
+        assert!(msg.contains("§8.6"), "wrong error (no §8.6 cite): {msg}");
+    }
+
+    #[test]
+    fn local_server_200_fallback_without_content_length_is_accepted() {
+        // §8.6 makes Content-Length a SHOULD on responses (not a MUST
+        // outside specific cases). A 200 with no Content-Length cannot
+        // be cross-checked against HEAD; we still walk the §3.1
+        // drain-prefix path. (HTTP/1.1 framing here uses Connection:
+        // close to delimit the body — RFC 9112 §6.3 case 7.)
+        static GET: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        std::io::Seek::seek(&mut src, SeekFrom::Start(4)).unwrap();
+        let mut buf = [0u8; 6];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"456789");
+    }
+
+    #[test]
+    fn local_server_206_content_length_mismatch_is_fatal() {
+        // §8.6: a 206's Content-Length is the count of bytes actually
+        // being sent. For our open-ended single-range request the
+        // implied span is `last - first + 1`. A header value that
+        // disagrees would let the downstream reader drift past the
+        // end of the satisfied range silently.
+        //
+        // We ask for bytes=0-; server replies with Content-Range
+        // 'bytes 0-9/10' (span 10) but Content-Length 5 (lie). The
+        // mismatch is what we surface, not whatever short body would
+        // arrive.
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 5\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            01234";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        let err = std::io::Read::read_exact(&mut src, &mut buf).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Content-Length 5"),
+            "wrong error (no 'Content-Length 5'): {msg}"
+        );
+        assert!(
+            msg.contains("Content-Range span 10"),
+            "wrong error (no 'Content-Range span 10'): {msg}"
+        );
+        assert!(msg.contains("§8.6"), "wrong error (no §8.6 cite): {msg}");
+    }
+
+    #[test]
+    fn local_server_206_matching_content_length_is_accepted() {
+        // Sanity: Content-Length 10 + Content-Range 'bytes 0-9/10'
+        // (span 10) is the canonical happy path and must continue to
+        // succeed.
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 10\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
     }
 }

@@ -1,0 +1,36 @@
+[package]
+name = "oxideav-http-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The crate's own internal header parsers (`parse_byte_content_range`,
+# `parse_byte_unsatisfied_range`, `parse_entity_tag`,
+# `parse_imf_fixdate`, `derive_strong_validator`) are reached through a
+# `#[doc(hidden)] pub mod __fuzz` re-export gated on the `fuzz`
+# feature, so the stable public surface stays the same when the crate
+# is consumed without the fuzz feature.
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-http]
+path = ".."
+features = ["fuzz"]
+
+# Detach from the umbrella workspace so `cargo build` at the workspace
+# root does not try to resolve the fuzz crate (and its libfuzzer-sys
+# pull-in).
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parse_headers"
+path = "fuzz_targets/parse_headers.rs"
+test = false
+doc = false

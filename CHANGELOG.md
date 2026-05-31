@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- RFC 9110 §8.6 `Content-Length` cross-checks on every GET response:
+  - On a §3.1 200-fallback (server ignored `Range` and shipped the
+    full body), the GET's `Content-Length` — when present — MUST
+    equal the `Content-Length` observed at HEAD. §8.6: HEAD's
+    `Content-Length` MUST equal what a GET would have sent. A
+    different value is a mid-stream resource resize disguised as a
+    soft-fallback; the driver now surfaces a fatal `io::Error`
+    rather than draining a now-wrong-sized prefix and reading
+    short.
+  - On a 206, the GET's `Content-Length` (when present) MUST equal
+    the byte span implied by `Content-Range: bytes <first>-<last>/N`
+    (`last - first + 1`). A mismatch is either a server bug or a
+    multipart/byteranges body (which the driver never requests);
+    either way the reader would drift past the satisfied range
+    silently.
+  - Both checks are skipped when the GET reply omits
+    `Content-Length` (§8.6 makes it a SHOULD outside specific
+    cases). 4 new local-TCP end-to-end tests cover 200-mismatch,
+    200-no-CL, 206-mismatch, and 206-canonical-match.
+- `fuzz/` cargo-fuzz harness (`parse_headers`) drives every internal
+  response-header parser used by the source driver
+  (`parse_byte_content_range`, `parse_byte_unsatisfied_range`,
+  `parse_entity_tag`, `parse_imf_fixdate`, `derive_strong_validator`).
+  The harness reaches the parsers through a `#[doc(hidden)] pub mod
+  __fuzz` re-export gated on the new `fuzz` cargo feature, so the
+  stable public surface is unchanged when the crate is consumed
+  normally. Seed corpus covers canonical 206 content-range,
+  star-complete, 416 unsatisfied-range, strong/weak ETag,
+  IMF-fixdate, and NUL-split derive_strong_validator combinations.
+
+### Changed
+
+- `oxideav-http` now declares a default-off `fuzz` cargo feature
+  (no transitive effect when unused — purely gates the
+  `#[doc(hidden)] pub mod __fuzz` re-export).
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-http/compare/v0.0.6...v0.0.7) - 2026-05-29
 
 ### Other
