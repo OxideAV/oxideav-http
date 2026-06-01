@@ -25,6 +25,12 @@
 //! * `parse_entity_tag` — RFC 9110 §8.8.3 entity-tag grammar.
 //! * `parse_imf_fixdate` — RFC 9110 §5.6.7 IMF-fixdate
 //!   `Wkd, DD Mon YYYY HH:MM:SS GMT`.
+//! * `parse_rfc850_date` — RFC 9110 §5.6.7 obsolete rfc850-date
+//!   `Weekday, DD-Mon-YY HH:MM:SS GMT` (a §5.6.7 MUST-accept form).
+//! * `parse_asctime_date` — RFC 9110 §5.6.7 obsolete asctime-date
+//!   `Wkd Mon  D HH:MM:SS YYYY` (a §5.6.7 MUST-accept form).
+//! * `parse_http_date` — unified §5.6.7 dispatcher that tries all
+//!   three forms in turn.
 //! * `derive_strong_validator` — §13.1.5 + §8.8.2.2 + §8.8.3
 //!   composite that picks an If-Range value from a HEAD's three
 //!   relevant headers.
@@ -39,6 +45,9 @@ fuzz_target!(|data: &[u8]| {
         let _ = __fuzz::parse_byte_unsatisfied_range(s);
         let _ = __fuzz::parse_entity_tag(s);
         let _ = __fuzz::parse_imf_fixdate(s);
+        let _ = __fuzz::parse_rfc850_date(s);
+        let _ = __fuzz::parse_asctime_date(s);
+        let _ = __fuzz::parse_http_date(s);
     }
 
     // Pass 2: NUL-split the input into up to three fields for the

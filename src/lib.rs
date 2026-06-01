@@ -815,14 +815,11 @@ fn parse_entity_tag(s: &str) -> Option<(bool, String)> {
     Some((is_weak, s.to_owned()))
 }
 
-/// Parse an HTTP-date per RFC 9110 §5.6.7 / §IMF-fixdate into a
+/// Parse the canonical IMF-fixdate form per RFC 9110 §5.6.7 into a
 /// (year, month, day, hour, minute, second) tuple. Only IMF-fixdate
-/// (`Sun, 06 Nov 1994 08:49:37 GMT`) is supported — §5.6.7 says senders
-/// MUST emit IMF-fixdate; the obsolete `rfc850` and `asctime` forms are
-/// "MUST accept" on the receiving side but we use this parser only for
-/// our own strong-validator promotion test, where IMF-fixdate is what
-/// every modern origin emits. A None means "couldn't promote to strong"
-/// which is the safe outcome.
+/// (`Sun, 06 Nov 1994 08:49:37 GMT`) is parsed here; the obsolete
+/// `rfc850-date` and `asctime-date` forms have their own parsers and
+/// the unified [`parse_http_date`] entry point dispatches between them.
 fn parse_imf_fixdate(s: &str) -> Option<(i32, u8, u8, u8, u8, u8)> {
     // Expect: "Wkd, DD Mon YYYY HH:MM:SS GMT"
     let s = s.trim();
@@ -838,21 +835,7 @@ fn parse_imf_fixdate(s: &str) -> Option<(i32, u8, u8, u8, u8, u8)> {
     if bytes[7] != b' ' {
         return None;
     }
-    let mon = match &s[8..11] {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
-        _ => return None,
-    };
+    let mon = parse_month_abbr(s.get(8..11)?)?;
     if bytes[11] != b' ' {
         return None;
     }
@@ -873,6 +856,189 @@ fn parse_imf_fixdate(s: &str) -> Option<(i32, u8, u8, u8, u8, u8)> {
         return None;
     }
     Some((year, mon, day, hour, minute, second))
+}
+
+/// Three-letter month abbreviation → 1..=12, per RFC 9110 §5.6.7
+/// `month` ABNF (case-sensitive). Shared between every HTTP-date form.
+fn parse_month_abbr(s: &str) -> Option<u8> {
+    match s {
+        "Jan" => Some(1),
+        "Feb" => Some(2),
+        "Mar" => Some(3),
+        "Apr" => Some(4),
+        "May" => Some(5),
+        "Jun" => Some(6),
+        "Jul" => Some(7),
+        "Aug" => Some(8),
+        "Sep" => Some(9),
+        "Oct" => Some(10),
+        "Nov" => Some(11),
+        "Dec" => Some(12),
+        _ => None,
+    }
+}
+
+/// Parse the obsolete `rfc850-date` form per RFC 9110 §5.6.7 ABNF:
+///
+/// ```text
+/// rfc850-date  = day-name-l "," SP date2 SP time-of-day SP GMT
+/// date2        = day "-" month "-" 2DIGIT          ; e.g. 02-Jun-82
+/// day-name-l   = "Monday" / "Tuesday" / "Wednesday"
+///              / "Thursday" / "Friday" / "Saturday" / "Sunday"
+/// ```
+///
+/// A typical example: `Sunday, 06-Nov-94 08:49:37 GMT`.
+///
+/// The 2-digit year is interpreted per §5.6.7's MUST: a value that would
+/// otherwise be more than 50 years in the future is wrapped to the most
+/// recent year in the past with the same last two digits. The reference
+/// year for the 50-year window is fixed at 2026 here — the rolling-clock
+/// approximation. Any non-zero margin is fine for the §8.8.2.2 "Date >=
+/// Last-Modified + 1 s" comparison, which is the only consumer.
+fn parse_rfc850_date(s: &str) -> Option<(i32, u8, u8, u8, u8, u8)> {
+    let s = s.trim();
+    // Split on ", " to separate the (variable-length) day-name-l from
+    // the fixed-width "DD-Mon-YY HH:MM:SS GMT" tail.
+    let (wkd, rest) = s.split_once(", ")?;
+    // Validate day-name-l literally — keeps us from accepting
+    // IMF-fixdate's three-letter "Sun, " accidentally (the comma+SP
+    // split would otherwise allow it; rejecting non-l names here makes
+    // each parser own its own grammar).
+    match wkd {
+        "Monday" | "Tuesday" | "Wednesday" | "Thursday" | "Friday" | "Saturday" | "Sunday" => {}
+        _ => return None,
+    }
+    let bytes = rest.as_bytes();
+    // "DD-Mon-YY HH:MM:SS GMT" = 22 bytes
+    if bytes.len() != 22 {
+        return None;
+    }
+    let day: u8 = rest.get(0..2)?.parse().ok()?;
+    if bytes[2] != b'-' {
+        return None;
+    }
+    let mon = parse_month_abbr(rest.get(3..6)?)?;
+    if bytes[6] != b'-' {
+        return None;
+    }
+    let yy: u32 = rest.get(7..9)?.parse().ok()?;
+    if bytes[9] != b' ' {
+        return None;
+    }
+    let hour: u8 = rest.get(10..12)?.parse().ok()?;
+    if bytes[12] != b':' {
+        return None;
+    }
+    let minute: u8 = rest.get(13..15)?.parse().ok()?;
+    if bytes[15] != b':' {
+        return None;
+    }
+    let second: u8 = rest.get(16..18)?.parse().ok()?;
+    if &rest[18..] != " GMT" {
+        return None;
+    }
+    Some((rfc850_expand_year(yy), mon, day, hour, minute, second))
+}
+
+/// Expand a 2-digit year per RFC 9110 §5.6.7's sliding-window rule:
+/// "Recipients of a timestamp value in rfc850-date format ... MUST
+/// interpret a timestamp that appears to be more than 50 years in the
+/// future as representing the most recent year in the past that had the
+/// same last two digits."
+///
+/// Reference year is a compile-time constant (`REF_YEAR_2DIGIT_BASE`)
+/// chosen to keep us inside the 50-year window for current traffic.
+/// A 2-digit year `yy` first maps to `cc*100 + yy` for the current
+/// century; if that lands more than 50 years past `REF_YEAR`, the
+/// previous century is used.
+fn rfc850_expand_year(yy: u32) -> i32 {
+    // The §5.6.7 rule is "more than 50 years in the future"; we anchor
+    // the window at a fixed reference rather than the system clock so
+    // the parser is deterministic across machines / time.
+    const REF_YEAR: i32 = 2026;
+    let century = (REF_YEAR / 100) * 100;
+    let candidate = century + yy as i32;
+    if candidate - REF_YEAR > 50 {
+        candidate - 100
+    } else {
+        candidate
+    }
+}
+
+/// Parse the obsolete `asctime-date` form per RFC 9110 §5.6.7 ABNF:
+///
+/// ```text
+/// asctime-date = day-name SP date3 SP time-of-day SP year
+/// date3        = month SP ( 2DIGIT / ( SP 1DIGIT ))  ; e.g. Jun  2
+/// day-name     = "Mon" / "Tue" / "Wed" / "Thu" / "Fri" / "Sat" / "Sun"
+/// ```
+///
+/// Typical example: `Sun Nov  6 08:49:37 1994`. Note the day field is
+/// either two digits or `SP + 1 digit` — the single-space-padded form
+/// is what ANSI C `asctime()` emits for days 1..9.
+///
+/// §5.6.7: "values in the asctime format are assumed to be in UTC".
+fn parse_asctime_date(s: &str) -> Option<(i32, u8, u8, u8, u8, u8)> {
+    // Format is exactly: "Www Mmm DD HH:MM:SS YYYY" (24 chars) when day
+    // has 2 digits, and "Www Mmm  D HH:MM:SS YYYY" (24 chars) when day
+    // has 1 digit (SP-padded). Both are 24 bytes total.
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    if bytes.len() != 24 {
+        return None;
+    }
+    let wkd = s.get(0..3)?;
+    match wkd {
+        "Mon" | "Tue" | "Wed" | "Thu" | "Fri" | "Sat" | "Sun" => {}
+        _ => return None,
+    }
+    if bytes[3] != b' ' {
+        return None;
+    }
+    let mon = parse_month_abbr(s.get(4..7)?)?;
+    if bytes[7] != b' ' {
+        return None;
+    }
+    // date3: either "DD" or " D"
+    let day_field = s.get(8..10)?;
+    let day: u8 = if let Some(b) = day_field.strip_prefix(' ') {
+        // SP + 1 digit form — accept only one digit.
+        if b.len() != 1 || !b.as_bytes()[0].is_ascii_digit() {
+            return None;
+        }
+        b.parse().ok()?
+    } else {
+        day_field.parse().ok()?
+    };
+    if bytes[10] != b' ' {
+        return None;
+    }
+    let hour: u8 = s.get(11..13)?.parse().ok()?;
+    if bytes[13] != b':' {
+        return None;
+    }
+    let minute: u8 = s.get(14..16)?.parse().ok()?;
+    if bytes[16] != b':' {
+        return None;
+    }
+    let second: u8 = s.get(17..19)?.parse().ok()?;
+    if bytes[19] != b' ' {
+        return None;
+    }
+    let year: i32 = s.get(20..24)?.parse().ok()?;
+    Some((year, mon, day, hour, minute, second))
+}
+
+/// Unified HTTP-date parser per RFC 9110 §5.6.7. Tries IMF-fixdate
+/// first (the form every modern origin emits — §5.6.7 senders MUST
+/// emit this), then falls back to `rfc850-date`, then `asctime-date`.
+///
+/// §5.6.7 makes accepting all three forms a MUST on the recipient side;
+/// this is the single entry point that satisfies it.
+fn parse_http_date(s: &str) -> Option<(i32, u8, u8, u8, u8, u8)> {
+    parse_imf_fixdate(s)
+        .or_else(|| parse_rfc850_date(s))
+        .or_else(|| parse_asctime_date(s))
 }
 
 /// Convert an IMF-fixdate (already in UTC per §5.6.7 "GMT") into a
@@ -898,10 +1064,13 @@ fn imf_seconds(d: (i32, u8, u8, u8, u8, u8)) -> i64 {
 /// Returns `Some(StrongValidator::Etag(_))` when the HEAD's `ETag` is a
 /// syntactically valid strong entity-tag (no `W/` prefix). Otherwise
 /// returns `Some(StrongValidator::LastModified(_))` only when both
-/// `Last-Modified` and `Date` parse as IMF-fixdate and the §8.8.2.2
-/// promotion rule holds (`Date >= Last-Modified + 1 second`). Returns
-/// `None` otherwise — the read path then issues plain Range GETs with
-/// no `If-Range`.
+/// `Last-Modified` and `Date` parse as one of the §5.6.7 HTTP-date
+/// forms (IMF-fixdate / rfc850-date / asctime-date — §5.6.7 makes
+/// accepting all three a MUST on recipients) AND the §8.8.2.2
+/// promotion rule holds (`Date >= Last-Modified + 1 second`). The two
+/// headers do not need to share the same date form. Returns `None`
+/// otherwise — the read path then issues plain Range GETs with no
+/// `If-Range`.
 fn derive_strong_validator(
     etag: Option<&str>,
     last_modified: Option<&str>,
@@ -915,7 +1084,13 @@ fn derive_strong_validator(
         }
     }
     if let (Some(lm), Some(dt)) = (last_modified, date) {
-        if let (Some(lm_p), Some(dt_p)) = (parse_imf_fixdate(lm), parse_imf_fixdate(dt)) {
+        // §5.6.7 makes accepting all three HTTP-date forms a MUST on
+        // recipients: try IMF-fixdate first, fall back to rfc850-date
+        // and asctime-date. Either header may legitimately use any
+        // form even though §5.6.7 requires senders to emit IMF-fixdate
+        // — older proxies and §5.6.7's own "be robust in parsing"
+        // guidance mean we still see the obsolete forms in the wild.
+        if let (Some(lm_p), Some(dt_p)) = (parse_http_date(lm), parse_http_date(dt)) {
             // §8.8.2.2: promotion requires Date strictly greater than
             // Last-Modified (at 1-second resolution). `dt > lm` is the
             // clippy-idiomatic spelling of `dt >= lm + 1` on integers.
@@ -1007,6 +1182,20 @@ pub mod __fuzz {
     /// Fuzz-only wrapper for [`super::parse_imf_fixdate`].
     pub fn parse_imf_fixdate(s: &str) -> bool {
         super::parse_imf_fixdate(s).is_some()
+    }
+    /// Fuzz-only wrapper for [`super::parse_rfc850_date`].
+    pub fn parse_rfc850_date(s: &str) -> bool {
+        super::parse_rfc850_date(s).is_some()
+    }
+    /// Fuzz-only wrapper for [`super::parse_asctime_date`].
+    pub fn parse_asctime_date(s: &str) -> bool {
+        super::parse_asctime_date(s).is_some()
+    }
+    /// Fuzz-only wrapper for [`super::parse_http_date`] (the unified
+    /// §5.6.7 entry point covering IMF-fixdate / rfc850-date /
+    /// asctime-date).
+    pub fn parse_http_date(s: &str) -> bool {
+        super::parse_http_date(s).is_some()
     }
     /// Fuzz-only wrapper for [`super::derive_strong_validator`]. The
     /// caller splits the input on NUL bytes into up to three optional
@@ -1588,14 +1777,209 @@ mod tests {
 
     #[test]
     fn imf_fixdate_rejects_non_imf_forms() {
-        // Obsolete rfc850 and asctime forms — we only need to parse
-        // IMF-fixdate for the strong-validator promotion test.
+        // The IMF-fixdate parser itself is strict — the §5.6.7 MUST-
+        // accept on the other two forms is handled by `parse_http_date`
+        // dispatching to the dedicated rfc850 / asctime parsers.
         assert!(parse_imf_fixdate("Sunday, 06-Nov-94 08:49:37 GMT").is_none());
         assert!(parse_imf_fixdate("Sun Nov  6 08:49:37 1994").is_none());
         // Missing GMT suffix.
         assert!(parse_imf_fixdate("Sun, 06 Nov 1994 08:49:37").is_none());
         // Bogus month name.
         assert!(parse_imf_fixdate("Sun, 06 Foo 1994 08:49:37 GMT").is_none());
+    }
+
+    // -- RFC 9110 §5.6.7 obsolete rfc850-date form ---------------------------
+
+    #[test]
+    fn rfc850_date_parses_canonical_example() {
+        // §5.6.7 example. 2-digit year 94 expands to 1994 under the
+        // sliding-window rule (REF_YEAR=2026; 94→2094 is >50 years
+        // future → roll back a century).
+        let d = parse_rfc850_date("Sunday, 06-Nov-94 08:49:37 GMT").unwrap();
+        assert_eq!(d, (1994, 11, 6, 8, 49, 37));
+    }
+
+    #[test]
+    fn rfc850_date_parses_every_long_weekday_name() {
+        for wkd in [
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+            "Sunday",
+        ] {
+            let s = format!("{wkd}, 01-Jan-00 00:00:00 GMT");
+            assert!(parse_rfc850_date(&s).is_some(), "rejected {s:?}");
+        }
+    }
+
+    #[test]
+    fn rfc850_date_window_expands_year_per_section_5_6_7() {
+        // §5.6.7 MUST: a 2-digit year > 50 years in the future maps to
+        // the most recent past year with the same last two digits.
+        // REF_YEAR = 2026.
+        //
+        // 26 → 2026 (current ref year).
+        // 76 → 2076 (50 years out — still within the window, "more than
+        //   50 years in the future" is the trigger so 50 itself stays).
+        // 77 → 1977 (51 years out → wrap).
+        // 00 → 2000 (24 years past → unchanged).
+        // 99 → 1999 (-27 years → unchanged because not in the future).
+        let yr = |s: &str| parse_rfc850_date(s).unwrap().0;
+        assert_eq!(yr("Monday, 01-Jan-26 00:00:00 GMT"), 2026);
+        assert_eq!(yr("Monday, 01-Jan-76 00:00:00 GMT"), 2076);
+        assert_eq!(yr("Monday, 01-Jan-77 00:00:00 GMT"), 1977);
+        assert_eq!(yr("Monday, 01-Jan-00 00:00:00 GMT"), 2000);
+        assert_eq!(yr("Monday, 01-Jan-99 00:00:00 GMT"), 1999);
+    }
+
+    #[test]
+    fn rfc850_date_rejects_short_weekday_names() {
+        // The short three-letter "Sun" form is IMF-fixdate, not
+        // rfc850-date. The rfc850 parser must reject it (parse_http_date
+        // dispatches the right form).
+        assert!(parse_rfc850_date("Sun, 06-Nov-94 08:49:37 GMT").is_none());
+    }
+
+    #[test]
+    fn rfc850_date_rejects_malformed_strings() {
+        for bad in [
+            "",
+            "Sunday 06-Nov-94 08:49:37 GMT",   // missing comma
+            "Sunday, 06-Nov-94 08:49:37",      // missing GMT
+            "Sunday, 06/Nov/94 08:49:37 GMT",  // wrong separator
+            "Sunday, 06-Foo-94 08:49:37 GMT",  // bad month
+            "Sunday, AB-Nov-94 08:49:37 GMT",  // non-digit day
+            "Sunday, 06-Nov-9X 08:49:37 GMT",  // non-digit year
+            "Sunday, 06-Nov-94 08:49:37  GMT", // extra space (§5.6.7 forbids)
+        ] {
+            assert!(
+                parse_rfc850_date(bad).is_none(),
+                "expected reject for {bad:?}"
+            );
+        }
+    }
+
+    // -- RFC 9110 §5.6.7 obsolete asctime-date form ---------------------------
+
+    #[test]
+    fn asctime_date_parses_canonical_example() {
+        // §5.6.7 example. Double space after month means day is the
+        // SP-padded single-digit form.
+        let d = parse_asctime_date("Sun Nov  6 08:49:37 1994").unwrap();
+        assert_eq!(d, (1994, 11, 6, 8, 49, 37));
+    }
+
+    #[test]
+    fn asctime_date_parses_two_digit_day() {
+        // Day 06 written with leading zero is NOT what asctime emits,
+        // but §5.6.7 date3 = month SP ( 2DIGIT / ( SP 1DIGIT )) so
+        // "Nov 06" is a valid 2DIGIT alternative. Be lenient per
+        // §5.6.7's "be robust in parsing" note.
+        let d = parse_asctime_date("Mon Nov 30 23:59:59 1994").unwrap();
+        assert_eq!(d, (1994, 11, 30, 23, 59, 59));
+    }
+
+    #[test]
+    fn asctime_date_rejects_malformed_strings() {
+        for bad in [
+            "",
+            "Sun Nov  6 08:49:37 199",  // short year (23 bytes total)
+            "Sun XYZ  6 08:49:37 1994", // bad month
+            "Foo Nov  6 08:49:37 1994", // bad day-name
+            "Sun Nov  6 08-49-37 1994", // wrong time separator
+            "Sun, Nov 6 08:49:37 1994", // stray comma (changes layout)
+            "Sun Nov   6 08:49:37 199", // 23 bytes — short
+        ] {
+            assert!(
+                parse_asctime_date(bad).is_none(),
+                "expected reject for {bad:?}"
+            );
+        }
+    }
+
+    // -- §5.6.7 unified HTTP-date parser dispatches all three forms ----------
+
+    #[test]
+    fn http_date_accepts_all_three_5_6_7_forms() {
+        // §5.6.7 MUST: a recipient MUST accept all three HTTP-date
+        // formats. The unified entry point covers that.
+        assert!(parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").is_some()); // IMF-fixdate
+        assert!(parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT").is_some()); // rfc850
+        assert!(parse_http_date("Sun Nov  6 08:49:37 1994").is_some()); // asctime
+    }
+
+    #[test]
+    fn http_date_returns_same_components_across_forms() {
+        // The three §5.6.7 examples all denote the same UTC instant.
+        // The parser must produce identical (y, mo, d, h, mi, s) tuples
+        // for each so downstream §8.8.2.2 second-comparison works
+        // regardless of which form an origin emits.
+        let imf = parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+        let rfc850 = parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT").unwrap();
+        let asctime = parse_http_date("Sun Nov  6 08:49:37 1994").unwrap();
+        assert_eq!(imf, rfc850);
+        assert_eq!(imf, asctime);
+    }
+
+    #[test]
+    fn http_date_rejects_garbage() {
+        for bad in ["", "not a date", "1994-11-06T08:49:37Z", "Sun, BAD"] {
+            assert!(
+                parse_http_date(bad).is_none(),
+                "expected reject for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_strong_validator_accepts_rfc850_dates() {
+        // Strong-validator promotion path (§13.1.5 + §8.8.2.2) now
+        // works for rfc850-date headers, not just IMF-fixdate.
+        let v = derive_strong_validator(
+            None,
+            Some("Sunday, 06-Nov-94 08:49:37 GMT"),
+            Some("Sunday, 06-Nov-94 08:49:42 GMT"),
+        );
+        assert_eq!(
+            v,
+            Some(StrongValidator::LastModified(
+                "Sunday, 06-Nov-94 08:49:37 GMT".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn derive_strong_validator_accepts_asctime_dates() {
+        // Same path, asctime-date forms. The Last-Modified value is
+        // echoed back verbatim as the If-Range field, which is what
+        // §13.1.5 requires (we don't normalise the wire form).
+        let v = derive_strong_validator(
+            None,
+            Some("Sun Nov  6 08:49:37 1994"),
+            Some("Sun Nov  6 08:49:42 1994"),
+        );
+        assert_eq!(
+            v,
+            Some(StrongValidator::LastModified(
+                "Sun Nov  6 08:49:37 1994".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn derive_strong_validator_accepts_mixed_forms_across_headers() {
+        // §5.6.7 doesn't constrain different fields in a single message
+        // to use the same form. Last-Modified in IMF-fixdate + Date in
+        // rfc850-date must still promote when the 1-second rule holds.
+        let v = derive_strong_validator(
+            None,
+            Some("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some("Sunday, 06-Nov-94 08:49:42 GMT"),
+        );
+        assert!(matches!(v, Some(StrongValidator::LastModified(_))));
     }
 
     #[test]

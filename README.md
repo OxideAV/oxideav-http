@@ -133,7 +133,14 @@ opening `HEAD` and a later `Range` GET. At `HEAD` we capture a
   §13.1.5).
 - Failing that, `Last-Modified` is taken only when the companion
   `Date` header is at least one second after it (§8.8.2.2's
-  promotion rule from "implicitly weak" to "strong").
+  promotion rule from "implicitly weak" to "strong"). Both headers
+  are parsed through a unified §5.6.7 HTTP-date reader that accepts
+  all three forms a recipient MUST accept — IMF-fixdate
+  (`Sun, 06 Nov 1994 08:49:37 GMT`), the obsolete `rfc850-date`
+  (`Sunday, 06-Nov-94 08:49:37 GMT`, 2-digit year expanded under
+  §5.6.7's 50-year sliding window MUST), and the obsolete
+  `asctime-date` (`Sun Nov  6 08:49:37 1994`). The two headers do
+  not need to share the same form.
 - Otherwise no validator is captured and the read path issues
   plain `Range` GETs (matching pre-r186 behaviour).
 
@@ -153,8 +160,10 @@ prefix-drain fallback still applies unchanged.
 every internal response-header parser used by the source driver —
 `parse_byte_content_range` (RFC 7233 §4.2 / RFC 9110 §14.4),
 `parse_byte_unsatisfied_range` (§14.4), `parse_entity_tag` (§8.8.3),
-`parse_imf_fixdate` (§5.6.7), and the composite
-`derive_strong_validator` (§13.1.5 + §8.8.2.2 + §8.8.3). The harness
+`parse_imf_fixdate` / `parse_rfc850_date` / `parse_asctime_date`
+plus the unified §5.6.7 dispatcher `parse_http_date`, and the
+composite `derive_strong_validator` (§13.1.5 + §8.8.2.2 + §8.8.3).
+The harness
 reaches the parsers through a `#[doc(hidden)] pub mod __fuzz`
 re-export gated on the `fuzz` cargo feature, so the stable public
 surface is unchanged when the crate is consumed normally.

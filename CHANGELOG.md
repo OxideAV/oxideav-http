@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- RFC 9110 §5.6.7 HTTP-date receiver-side conformance: the strong-
+  validator promotion path (§13.1.5 + §8.8.2.2) now accepts all three
+  HTTP-date forms a recipient MUST accept, not just IMF-fixdate.
+  - New `parse_rfc850_date` parses the obsolete `rfc850-date`
+    `Weekday, DD-Mon-YY HH:MM:SS GMT` form. The 2-digit year follows
+    §5.6.7's sliding-window MUST: a value that would otherwise land
+    more than 50 years in the future maps to the most recent past
+    year with the same last two digits (anchored at REF_YEAR=2026).
+  - New `parse_asctime_date` parses the obsolete `asctime-date`
+    `Wkd Mon DD HH:MM:SS YYYY` (with the day field accepting both the
+    `2DIGIT` and `SP 1DIGIT` alternatives in §5.6.7's `date3` ABNF).
+    §5.6.7: "values in the asctime format are assumed to be in UTC".
+  - New `parse_http_date` is the unified §5.6.7 entry point —
+    IMF-fixdate first (the form senders MUST emit), rfc850-date
+    next, asctime-date last. `derive_strong_validator` now calls
+    this entry point, so origins that emit Last-Modified/Date in
+    either obsolete form (still seen in the wild — §5.6.7 makes
+    accepting them a MUST on the recipient) light up the
+    `If-Range` strong-validator path instead of falling silently to
+    no-validator mode. Last-Modified and Date are no longer
+    required to use the same form.
+  - 14 new unit tests cover: canonical rfc850/asctime examples,
+    every long weekday name, the sliding-window year expansion
+    (26/76/77/00/99 — confirms the 50-year boundary), malformed
+    rejections for both new parsers, the §5.6.7 MUST-accept-all-
+    three guarantee on `parse_http_date`, identical-instant
+    cross-form equality, and `derive_strong_validator` lighting up
+    on rfc850-date / asctime-date / mixed-form inputs.
+  - Fuzz harness gains 3 new wrappers (`parse_rfc850_date`,
+    `parse_asctime_date`, `parse_http_date`) and seed corpus
+    entries for the canonical §5.6.7 examples of each obsolete
+    form.
 - RFC 9110 §8.6 `Content-Length` cross-checks on every GET response:
   - On a §3.1 200-fallback (server ignored `Range` and shipped the
     full body), the GET's `Content-Length` — when present — MUST
