@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- RFC 9110 §10.2.3 `Retry-After` header parser. New public
+  `parse_retry_after(&str) -> Option<RetryAfter>` consumes the
+  `HTTP-date / delay-seconds` grammar and returns a typed
+  `RetryAfter` enum — `Delay(Duration)` for the
+  `delay-seconds = 1*DIGIT` form, `Date { year, month, day, hour,
+  minute, second }` for the HTTP-date form. All three §5.6.7
+  receiver-side date forms are accepted (matching the §5.6.7 MUST).
+  The driver itself does not act on `Retry-After` — interpreting
+  an absolute UTC date requires a clock the source does not own,
+  and back-off strategy belongs in the caller — but exposing the
+  parser lets consumers honour 503 / 429 / 3xx-with-Retry-After
+  responses without rewriting the §10.2.3 grammar themselves.
+  - The grammar is intentionally strict: a leading `+`/`-`, a
+    fractional or hex literal, an all-digit value that overflows
+    `u64` (≈ 584 billion years), or a unit-bearing form (`"120s"`)
+    all yield `None`. The disjoint nature of `delay-seconds` vs
+    `HTTP-date` (the former is pure-digit, every accepted
+    HTTP-date form opens with an alphabetic weekday) is exploited
+    to disambiguate without trial-parsing both branches.
+  - 15 new unit tests cover both §10.2.3 spec example values
+    (`120` and `Fri, 31 Dec 1999 23:59:59 GMT`), the zero-delay
+    edge, large-but-in-range u64 delays, OWS trimming, the three
+    §5.6.7 date forms (IMF-fixdate / rfc850-date / asctime-date),
+    every documented rejection path (empty, signed, decimal,
+    hex, trailing units, u64 overflow, malformed date), and the
+    pure-digit disambiguation case (`"1994"` parses as 1994
+    seconds, not the year 1994).
+  - Fuzz harness gains a `parse_retry_after` wrapper and two new
+    seed-corpus entries (`retry_after_delay`, `retry_after_date`)
+    pinning the §10.2.3 example values.
 - RFC 9110 §5.6.7 HTTP-date receiver-side conformance: the strong-
   validator promotion path (§13.1.5 + §8.8.2.2) now accepts all three
   HTTP-date forms a recipient MUST accept, not just IMF-fixdate.

@@ -1041,6 +1041,101 @@ fn parse_http_date(s: &str) -> Option<(i32, u8, u8, u8, u8, u8)> {
         .or_else(|| parse_asctime_date(s))
 }
 
+/// A parsed `Retry-After` header value per RFC 9110 §10.2.3.
+///
+/// Servers send this header to indicate how long a user agent ought to
+/// wait before issuing a follow-up request. The grammar is
+///
+/// ```text
+/// Retry-After   = HTTP-date / delay-seconds
+/// delay-seconds = 1*DIGIT
+/// ```
+///
+/// We surface both variants — the delay-seconds form as a
+/// [`std::time::Duration`] for direct sleep-arithmetic, the HTTP-date
+/// form as the same six-tuple `(year, month, day, hour, minute,
+/// second)` that the §5.6.7 parsers return so the caller can compare
+/// against its own clock without dragging a date-time crate in. The
+/// driver does NOT itself wall-clock the date — interpreting "wait
+/// until this absolute time" requires a clock the source does not
+/// own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryAfter {
+    /// `Retry-After: <N>` — delay this many seconds from receipt of
+    /// the response. §10.2.3 mandates a non-negative decimal integer
+    /// (`1*DIGIT`).
+    Delay(Duration),
+    /// `Retry-After: <HTTP-date>` — wait until this absolute UTC time.
+    /// All three §5.6.7 forms are accepted on the receiver side
+    /// (IMF-fixdate / rfc850-date / asctime-date), matching the MUST
+    /// in §5.6.7.
+    Date {
+        /// Four-digit calendar year (1-9999, but the §5.6.7 sliding
+        /// window for rfc850-date constrains real-world values to
+        /// roughly REF_YEAR-49..=REF_YEAR+49).
+        year: i32,
+        /// Calendar month, 1-12.
+        month: u8,
+        /// Day of month, 1-31.
+        day: u8,
+        /// Hour, 0-23.
+        hour: u8,
+        /// Minute, 0-59.
+        minute: u8,
+        /// Second, 0-60 (the §5.6.7 grammar allows 60 for leap
+        /// seconds; the parser does not range-check it specially).
+        second: u8,
+    },
+}
+
+/// Parse a `Retry-After` field value per RFC 9110 §10.2.3.
+///
+/// ABNF: `Retry-After = HTTP-date / delay-seconds` where
+/// `delay-seconds = 1*DIGIT`. The grammar is `delay-seconds`
+/// disjoint from `HTTP-date`, so we try `delay-seconds` first
+/// (cheaper, ambiguity-free — pure digits cannot match any of the
+/// three HTTP-date forms which all start with an alphabetic weekday
+/// name or token) then fall back to `parse_http_date`.
+///
+/// Returns `None` on syntactically invalid input (leading sign,
+/// non-numeric characters in the delay-seconds form that also fail
+/// every HTTP-date form, empty input, etc.). §10.2.3 makes
+/// `delay-seconds` "a non-negative decimal integer" — we reject a
+/// leading `+` or `-` even though Rust's `u64::parse` would refuse
+/// `-` natively, because `+` would otherwise parse successfully.
+pub fn parse_retry_after(s: &str) -> Option<RetryAfter> {
+    // §10.2.3 doesn't itself say "OWS-tolerant" but every other
+    // field value in §5.6 is trimmed of surrounding OWS at field-
+    // parse time; we match that convention here.
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // delay-seconds = 1*DIGIT. A leading sign would parse via
+    // `u64::from_str` for `+` only; reject explicitly so the
+    // §10.2.3 "non-negative decimal integer" rule is enforced
+    // grammar-strictly rather than accidentally.
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(n) = s.parse::<u64>() {
+            return Some(RetryAfter::Delay(Duration::from_secs(n)));
+        }
+        // All-digit but overflows u64 — §10.2.3 has no upper
+        // bound, but a value that doesn't fit u64 seconds (≈ 584
+        // billion years) is not a real-world Retry-After. Surface
+        // as "unparseable" rather than silently saturating.
+        return None;
+    }
+    let (year, month, day, hour, minute, second) = parse_http_date(s)?;
+    Some(RetryAfter::Date {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+    })
+}
+
 /// Convert an IMF-fixdate (already in UTC per §5.6.7 "GMT") into a
 /// strictly-monotonic 64-bit second count from a fixed epoch. Used only
 /// for the §8.8.2.2 "Date >= Last-Modified + 1 s" comparison, so any
@@ -1196,6 +1291,11 @@ pub mod __fuzz {
     /// asctime-date).
     pub fn parse_http_date(s: &str) -> bool {
         super::parse_http_date(s).is_some()
+    }
+    /// Fuzz-only wrapper for [`super::parse_retry_after`] (RFC 9110
+    /// §10.2.3 — `HTTP-date / delay-seconds`).
+    pub fn parse_retry_after(s: &str) -> bool {
+        super::parse_retry_after(s).is_some()
     }
     /// Fuzz-only wrapper for [`super::derive_strong_validator`]. The
     /// caller splits the input on NUL bytes into up to three optional
@@ -2062,6 +2162,171 @@ mod tests {
                 "Sun, 06 Nov 1994 08:49:37 GMT".into()
             ))
         );
+    }
+
+    // -- RFC 9110 §10.2.3 Retry-After parser ---------------------------------
+
+    #[test]
+    fn retry_after_parses_canonical_delay_seconds_form() {
+        // §10.2.3 example: "Retry-After: 120" means wait two minutes.
+        assert_eq!(
+            parse_retry_after("120"),
+            Some(RetryAfter::Delay(Duration::from_secs(120)))
+        );
+    }
+
+    #[test]
+    fn retry_after_parses_zero_delay() {
+        // §10.2.3 delay-seconds = 1*DIGIT — zero is in-range.
+        assert_eq!(
+            parse_retry_after("0"),
+            Some(RetryAfter::Delay(Duration::from_secs(0)))
+        );
+    }
+
+    #[test]
+    fn retry_after_parses_large_delay_within_u64() {
+        // A small CDN reasonably emits "Retry-After: 86400" (one day).
+        assert_eq!(
+            parse_retry_after("86400"),
+            Some(RetryAfter::Delay(Duration::from_secs(86_400)))
+        );
+    }
+
+    #[test]
+    fn retry_after_trims_surrounding_whitespace() {
+        // Field-value parsers in this crate are OWS-tolerant per §5.6
+        // convention.
+        assert_eq!(
+            parse_retry_after("   42   "),
+            Some(RetryAfter::Delay(Duration::from_secs(42)))
+        );
+    }
+
+    #[test]
+    fn retry_after_parses_imf_fixdate_form() {
+        // §10.2.3 example: "Retry-After: Fri, 31 Dec 1999 23:59:59 GMT".
+        assert_eq!(
+            parse_retry_after("Fri, 31 Dec 1999 23:59:59 GMT"),
+            Some(RetryAfter::Date {
+                year: 1999,
+                month: 12,
+                day: 31,
+                hour: 23,
+                minute: 59,
+                second: 59,
+            })
+        );
+    }
+
+    #[test]
+    fn retry_after_parses_rfc850_date_form() {
+        // §5.6.7 MUSTs receiver acceptance of the obsolete rfc850
+        // form — Retry-After inherits that grammar.
+        assert_eq!(
+            parse_retry_after("Sunday, 06-Nov-94 08:49:37 GMT"),
+            Some(RetryAfter::Date {
+                year: 1994,
+                month: 11,
+                day: 6,
+                hour: 8,
+                minute: 49,
+                second: 37,
+            })
+        );
+    }
+
+    #[test]
+    fn retry_after_parses_asctime_form() {
+        // §5.6.7 MUSTs receiver acceptance of the obsolete asctime
+        // form.
+        assert_eq!(
+            parse_retry_after("Sun Nov  6 08:49:37 1994"),
+            Some(RetryAfter::Date {
+                year: 1994,
+                month: 11,
+                day: 6,
+                hour: 8,
+                minute: 49,
+                second: 37,
+            })
+        );
+    }
+
+    #[test]
+    fn retry_after_rejects_empty_input() {
+        assert_eq!(parse_retry_after(""), None);
+        assert_eq!(parse_retry_after("   "), None);
+    }
+
+    #[test]
+    fn retry_after_rejects_signed_delay_seconds() {
+        // §10.2.3 delay-seconds = 1*DIGIT (non-negative decimal
+        // integer); a leading sign is grammar-invalid even though
+        // `u64::parse` would refuse it for the negative form.
+        assert_eq!(parse_retry_after("-1"), None);
+        // The crucial case: `+5` would round-trip through
+        // `u64::from_str` on some toolchains; reject explicitly via
+        // the all-digit gate.
+        assert_eq!(parse_retry_after("+5"), None);
+    }
+
+    #[test]
+    fn retry_after_rejects_decimal_or_hex_delay() {
+        // Pure 1*DIGIT — no fractions, no hex prefix.
+        assert_eq!(parse_retry_after("12.5"), None);
+        assert_eq!(parse_retry_after("0x10"), None);
+        assert_eq!(parse_retry_after("1_000"), None);
+    }
+
+    #[test]
+    fn retry_after_rejects_delay_with_trailing_garbage() {
+        // "120s" looks like a unit-bearing delay but §10.2.3 grammar
+        // is bare digits.
+        assert_eq!(parse_retry_after("120s"), None);
+        assert_eq!(parse_retry_after("120 seconds"), None);
+    }
+
+    #[test]
+    fn retry_after_rejects_u64_overflow() {
+        // §10.2.3 has no upper bound, but a value that doesn't fit
+        // u64 seconds (≈ 584 billion years) is not a real-world
+        // Retry-After. We surface None rather than saturate.
+        // 2^64 = 18446744073709551616 — one beyond u64::MAX.
+        assert_eq!(parse_retry_after("18446744073709551616"), None);
+    }
+
+    #[test]
+    fn retry_after_rejects_malformed_date() {
+        // Not a §5.6.7 date in any of the three accepted forms.
+        assert_eq!(parse_retry_after("never"), None);
+        assert_eq!(parse_retry_after("Tomorrow at noon"), None);
+        assert_eq!(parse_retry_after("Fri, 31 Dec 1999 23:59:59 UTC"), None);
+    }
+
+    #[test]
+    fn retry_after_disambiguates_digit_only_from_date() {
+        // §10.2.3 grammar is `HTTP-date / delay-seconds` — disjoint
+        // (a pure-digit string cannot match any of the three HTTP-
+        // date forms which all begin with an alphabetic weekday
+        // name or token). Confirm we pick the delay branch for a
+        // pure-digit input even though "1994" could be misread as
+        // a year fragment by a sloppy parser.
+        assert_eq!(
+            parse_retry_after("1994"),
+            Some(RetryAfter::Delay(Duration::from_secs(1994)))
+        );
+    }
+
+    #[test]
+    fn retry_after_examples_from_spec_appendix_round_trip() {
+        // §10.2.3 names two example values verbatim. Pin both so a
+        // future regression cannot silently change behaviour on the
+        // canonical inputs.
+        let a = parse_retry_after("Fri, 31 Dec 1999 23:59:59 GMT");
+        let b = parse_retry_after("120");
+        assert!(matches!(a, Some(RetryAfter::Date { year: 1999, .. })));
+        assert!(matches!(b, Some(RetryAfter::Delay(d)) if d == Duration::from_secs(120)));
     }
 
     /// Variant of `spawn_server` that captures the GET request bytes

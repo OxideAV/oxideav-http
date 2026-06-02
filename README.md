@@ -154,6 +154,48 @@ never silently re-anchors against a different resource. When no
 `If-Range` was sent (no strong validator at HEAD), the §3.1
 prefix-drain fallback still applies unchanged.
 
+## Retry-After parsing (RFC 9110 §10.2.3)
+
+The free function `parse_retry_after` consumes a `Retry-After`
+field value and returns a typed [`RetryAfter`] enum — either a
+`Delay(Duration)` for the `delay-seconds = 1*DIGIT` form or a
+`Date { year, month, day, hour, minute, second }` for the
+HTTP-date form. All three §5.6.7 receiver-side date forms
+(IMF-fixdate, rfc850-date, asctime-date) are accepted in
+keeping with §5.6.7's MUST.
+
+```rust
+use std::time::Duration;
+use oxideav_http::{parse_retry_after, RetryAfter};
+
+assert_eq!(
+    parse_retry_after("120"),
+    Some(RetryAfter::Delay(Duration::from_secs(120))),
+);
+assert!(matches!(
+    parse_retry_after("Fri, 31 Dec 1999 23:59:59 GMT"),
+    Some(RetryAfter::Date { year: 1999, .. }),
+));
+```
+
+The driver does NOT itself sleep on `Retry-After` — interpreting
+"wait until this absolute UTC time" requires a clock the source
+does not own, and a back-off strategy belongs in the caller. The
+parser is exported so consumers that *do* hold both can act on
+503 / 429 / 3xx-with-Retry-After responses without writing the
+§10.2.3 grammar a second time.
+
+The §10.2.3 grammar is intentionally strict:
+
+- `delay-seconds` is 1*DIGIT — a leading `+` or `-`, fractional
+  digits, hex prefixes, or trailing units (`"120s"`) all
+  produce `None`.
+- An all-digit value that overflows `u64` (≈ 584 billion years
+  worth of seconds) surfaces `None` rather than saturating.
+- A non-digit value MUST parse through `parse_http_date`
+  (IMF-fixdate / rfc850-date / asctime-date) — random tokens
+  like `"never"` or `"Tomorrow at noon"` produce `None`.
+
 ## Fuzzing
 
 `fuzz/` carries a cargo-fuzz harness (`parse_headers`) that drives
@@ -161,8 +203,9 @@ every internal response-header parser used by the source driver —
 `parse_byte_content_range` (RFC 7233 §4.2 / RFC 9110 §14.4),
 `parse_byte_unsatisfied_range` (§14.4), `parse_entity_tag` (§8.8.3),
 `parse_imf_fixdate` / `parse_rfc850_date` / `parse_asctime_date`
-plus the unified §5.6.7 dispatcher `parse_http_date`, and the
-composite `derive_strong_validator` (§13.1.5 + §8.8.2.2 + §8.8.3).
+plus the unified §5.6.7 dispatcher `parse_http_date`,
+`parse_retry_after` (§10.2.3), and the composite
+`derive_strong_validator` (§13.1.5 + §8.8.2.2 + §8.8.3).
 The harness
 reaches the parsers through a `#[doc(hidden)] pub mod __fuzz`
 re-export gated on the `fuzz` cargo feature, so the stable public
