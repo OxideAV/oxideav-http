@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-http/compare/v0.0.7...v0.0.8) - 2026-06-03
+
+### Other
+
+- reject non-identity codings on every response (RFC 9110 §8.4)
+- §10.2.3 parser + 15 unit tests + fuzz coverage
+- accept rfc850 + asctime forms in §13.1.5 validator path
+
 ### Added
 
 - RFC 9110 §8.4 `Content-Encoding` rejection on every response path.
