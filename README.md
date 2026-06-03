@@ -56,6 +56,35 @@ once the process-wide agent has materialised. Call it before the first
 `ctx.sources.open(...)` if you need it to take effect on
 registry-dispatched opens.
 
+## Accept-Ranges classification (RFC 9110 §14.3)
+
+The opening `HEAD` reads `Accept-Ranges` through the §14.3 list-form
+parser (`acceptable-ranges = 1#range-unit`, §5.6.1 list constructor,
+OWS-tolerant) rather than a bare equality. That gives four distinct
+outcomes with separate error messages:
+
+- `Accept-Ranges: bytes` (alone or anywhere in a comma-separated
+  list, case-insensitive) — accepted; the driver proceeds.
+- `Accept-Ranges: none` — the §14.3-reserved "do not attempt"
+  advice. The driver returns an `Error::Unsupported` whose message
+  names the explicit refusal and the §14.3 cite, so a caller can
+  tell "server actively refused ranges" from "server didn't say".
+- `Accept-Ranges: <other-unit>` (any non-`bytes` token, single or
+  list) — the driver returns an `Error::Unsupported` that names the
+  offered unit(s). Useful diagnostic when a server speaks ranges in
+  some unit the driver doesn't (the driver currently only knows
+  `bytes`).
+- Header absent — the driver still refuses (the rest of the
+  read-path's `Content-Range` / `If-Range` invariants assume a
+  server that satisfies `Range:` requests), but the message is
+  distinct from the explicit-`none` case so a caller can tell
+  silence from refusal.
+
+Empty list elements (`bytes,,`) and non-token list elements (e.g. a
+slot with an embedded space) are tolerated — they are silently
+skipped so one garbage element next to a legitimate `bytes` does not
+black-hole the response.
+
 ## Range-response validation
 
 Every 206 (Partial Content) response is validated against RFC 7233
@@ -204,7 +233,8 @@ every internal response-header parser used by the source driver —
 `parse_byte_unsatisfied_range` (§14.4), `parse_entity_tag` (§8.8.3),
 `parse_imf_fixdate` / `parse_rfc850_date` / `parse_asctime_date`
 plus the unified §5.6.7 dispatcher `parse_http_date`,
-`parse_retry_after` (§10.2.3), and the composite
+`parse_retry_after` (§10.2.3),
+`parse_accept_ranges` (§14.3), and the composite
 `derive_strong_validator` (§13.1.5 + §8.8.2.2 + §8.8.3).
 The harness
 reaches the parsers through a `#[doc(hidden)] pub mod __fuzz`

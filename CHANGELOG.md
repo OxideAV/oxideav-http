@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- RFC 9110 §14.3 `Accept-Ranges` parser + classifier. The HEAD path now
+  consumes `Accept-Ranges` as the §14.3 ABNF `acceptable-ranges =
+  1#range-unit` list (§5.6.1 list constructor, OWS-tolerant, empty
+  members dropped) instead of a bare case-insensitive equality on
+  `"bytes"`. Behaviour change matrix:
+  - `Accept-Ranges: bytes` → unchanged (accept).
+  - `Accept-Ranges: bytes, foo-unit` → **now accepted** (was
+    rejected). Per §14.3 a server MAY advertise multiple range units
+    and the client acts on the one it speaks. Previously the bare
+    equality rejected any list form.
+  - `Accept-Ranges: none` → **distinct error message** ("server
+    explicitly refused range support … RFC 9110 §14.3"). §14.3
+    reserves `none` as the server's explicit "do not attempt"
+    advice; surfacing it distinctly from "absent" lets a caller tell
+    "server actively refused" from "server didn't say".
+  - `Accept-Ranges: foo-unit` (any non-`bytes` token-list) → distinct
+    error message naming the offered unit(s). Lets a caller report
+    "server speaks ranges, just not in our unit".
+  - Header absent → distinct error message ("server did not advertise
+    Accept-Ranges …"). §14.3 makes the field advisory, so absence is
+    informational; the driver still refuses for safety (the
+    Content-Range / If-Range invariants the rest of the pipeline
+    relies on assume a server that honours `Range:`) but the message
+    is no longer conflated with the explicit-`none` case.
+  - New `is_token` helper enforces §5.6.2 `tchar` validity per
+    list-element; non-token slots (e.g. embedded SP) are silently
+    skipped so one garbage element doesn't black-hole a legitimate
+    `bytes` next to it.
+  - 9 new parser unit tests (canonical bare-`bytes`, case-insensitive
+    matching, explicit-`none`, list-with-`bytes`, list-without-`bytes`,
+    `none`-alongside-other-units contradiction, empty/CSV-tolerance,
+    non-token-skip, `tchar` spot-check) + 4 new local-TCP end-to-end
+    tests (`Accept-Ranges: none` refusal message, list-with-`bytes`
+    accepted, non-`bytes`-only refusal naming the unit, absent-header
+    distinct message). All four messages include the `§14.3` cite
+    for grep-ability.
+  - Fuzz harness gains a `parse_accept_ranges` wrapper (returns the
+    classification tag so the fuzzer drives every branch) and 3 new
+    seed-corpus entries (`accept_ranges_bytes`, `accept_ranges_none`,
+    `accept_ranges_list`).
+
 - RFC 9110 §10.2.3 `Retry-After` header parser. New public
   `parse_retry_after(&str) -> Option<RetryAfter>` consumes the
   `HTTP-date / delay-seconds` grammar and returns a typed

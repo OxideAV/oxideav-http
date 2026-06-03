@@ -33,6 +33,9 @@
 //!   three forms in turn.
 //! * `parse_retry_after` — RFC 9110 §10.2.3 `HTTP-date /
 //!   delay-seconds` grammar for the `Retry-After` field.
+//! * `parse_accept_ranges` — RFC 9110 §14.3 `acceptable-ranges =
+//!   1#range-unit` list-form classifier (Bytes / None / Other /
+//!   Absent).
 //! * `derive_strong_validator` — §13.1.5 + §8.8.2.2 + §8.8.3
 //!   composite that picks an If-Range value from a HEAD's three
 //!   relevant headers.
@@ -51,6 +54,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = __fuzz::parse_asctime_date(s);
         let _ = __fuzz::parse_http_date(s);
         let _ = __fuzz::parse_retry_after(s);
+        let _ = __fuzz::parse_accept_ranges(s);
     }
 
     // Pass 2: NUL-split the input into up to three fields for the

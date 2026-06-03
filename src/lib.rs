@@ -409,14 +409,44 @@ impl HttpSource {
             .ok_or_else(|| {
                 Error::Unsupported(format!("HTTP HEAD {uri}: missing Content-Length"))
             })?;
-        let accept_ranges = headers
+        // RFC 9110 §14.3: `Accept-Ranges = 1#range-unit`. Use the §5.6.1
+        // list parser instead of a bare equality so a server returning
+        // `Accept-Ranges: bytes, foo-unit` (legitimate per §14.3) is
+        // accepted, and so an explicit `Accept-Ranges: none` (§14.3's
+        // reserved-token advice) is reported distinctly from "header
+        // absent" — the former is the server saying "do not attempt",
+        // the latter is silence (§14.3 makes the header advisory, not
+        // mandatory, even for range-capable servers).
+        let accept_ranges_raw = headers
             .get("accept-ranges")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if !accept_ranges.eq_ignore_ascii_case("bytes") {
-            return Err(Error::Unsupported(format!(
-                "HTTP HEAD {uri}: server does not advertise byte ranges (Accept-Ranges: '{accept_ranges}')"
-            )));
+        match parse_accept_ranges(accept_ranges_raw) {
+            AcceptRanges::Bytes => {}
+            AcceptRanges::None => {
+                return Err(Error::Unsupported(format!(
+                    "HTTP HEAD {uri}: server explicitly refused range support (Accept-Ranges: none, RFC 9110 §14.3)"
+                )));
+            }
+            AcceptRanges::Other(units) => {
+                return Err(Error::Unsupported(format!(
+                    "HTTP HEAD {uri}: server advertises range units {units:?} but not 'bytes' (RFC 9110 §14.3)"
+                )));
+            }
+            AcceptRanges::Absent => {
+                // §14.3: "A client MAY generate range requests
+                // regardless of having received an Accept-Ranges
+                // field." But the present driver's correctness model
+                // (validate Content-Range echo etc.) needs the server
+                // to actually satisfy them, and a HEAD that omits the
+                // hint is also far more likely to refuse. Preserve
+                // the historical refusal here so we don't quietly
+                // start issuing Range GETs against servers we'd have
+                // refused before; the message is now distinct.
+                return Err(Error::Unsupported(format!(
+                    "HTTP HEAD {uri}: server did not advertise Accept-Ranges (RFC 9110 §14.3)"
+                )));
+            }
         }
         // Capture a STRONG validator per RFC 9110 §13.1.5 so subsequent
         // range GETs can carry `If-Range: <validator>` and surface a
@@ -776,6 +806,138 @@ fn parse_byte_unsatisfied_range(s: &str) -> std::result::Result<u64, &'static st
         .parse()
         .map_err(|_| "complete-length is not a u64")?;
     Ok(complete)
+}
+
+/// What a `Accept-Ranges` response field tells the client about the
+/// server's willingness to satisfy a range request, per RFC 9110 §14.3.
+///
+/// §14.3 ABNF:
+///
+/// ```text
+/// Accept-Ranges     = acceptable-ranges
+/// acceptable-ranges = 1#range-unit
+/// range-unit        = token            ; §14.1
+/// ```
+///
+/// `1#X` is the list construction from RFC 9110 §5.6.1: a non-empty
+/// comma-separated list, OWS-tolerant on both sides of each comma. So
+/// `Accept-Ranges: bytes, foo-unit` legitimately advertises both units.
+/// The §14.1 range-unit names are case-insensitive (§14.1 cross-refs
+/// the §3.2.6 token rule).
+///
+/// §14.3 reserves the unit name `none` (lowercase by example, but a
+/// recipient treats it case-insensitively per §3.2.6 token equality)
+/// for the explicit "do not attempt a range request" advice. The list
+/// constructor in §5.6.1 explicitly tolerates a sender producing
+/// `none` alongside other units — the recipient SHOULD treat that as
+/// a contradiction, but §14.3 does not name a hard rule so the
+/// helper below reports `Other` rather than rejecting outright when
+/// `none` appears next to a real unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AcceptRanges {
+    /// Server advertised at least one range unit that includes `bytes`
+    /// (case-insensitive). Range requests are expected to work.
+    Bytes,
+    /// Server advertised exactly `none` (case-insensitive, single
+    /// element) — explicit advice not to attempt a range request per
+    /// §14.3 "The range unit 'none' is reserved for this purpose".
+    None,
+    /// Server advertised one or more range units but none of them is
+    /// `bytes`. Carries the original token list (lowercased, trimmed)
+    /// for diagnostic surfacing. Driver treats this like "no range
+    /// support" for the current driver (which only knows the `bytes`
+    /// unit), but distinguishes the message so a caller can tell
+    /// "server speaks ranges, just not in our unit" apart from "server
+    /// declined ranges entirely".
+    Other(Vec<String>),
+    /// The header was absent or contained only empty list elements.
+    /// §14.3 doesn't mandate the field's presence even when the server
+    /// supports ranges; this is informational, not a refusal.
+    Absent,
+}
+
+/// Parse a `Accept-Ranges` field value per RFC 9110 §14.3 ABNF.
+///
+/// Returns the categorised classification described on [`AcceptRanges`].
+///
+/// Empty list elements (e.g. the trailing element of `"bytes,"`) are
+/// silently dropped per §5.6.1 — the list construction expressly
+/// permits empty members and the recipient is meant to skip them.
+fn parse_accept_ranges(s: &str) -> AcceptRanges {
+    // §5.6.1: split on comma, then strip OWS on each element. Empty
+    // elements (zero-length after trim) are tolerated and dropped.
+    let mut tokens: Vec<String> = Vec::new();
+    let mut had_none = false;
+    let mut had_bytes = false;
+    for part in s.split(',') {
+        let tok = part.trim_matches(|c: char| c == ' ' || c == '\t');
+        if tok.is_empty() {
+            continue;
+        }
+        // §3.2.6 token validity: every byte in 1*tchar. We do not
+        // hard-fail on a non-token element; we just skip it so a
+        // misbehaving server that puts garbage in one slot doesn't
+        // black-hole the legitimate `bytes` next to it. The validity
+        // gate is intentionally permissive — the §14.3 advice value
+        // is the token itself, not how it was framed.
+        if !is_token(tok) {
+            continue;
+        }
+        let lower = tok.to_ascii_lowercase();
+        if lower == "bytes" {
+            had_bytes = true;
+        }
+        if lower == "none" {
+            had_none = true;
+        }
+        tokens.push(lower);
+    }
+    if tokens.is_empty() {
+        return AcceptRanges::Absent;
+    }
+    if had_bytes {
+        // §14.3 implicit rule: a server that advertises `bytes` MAY
+        // also advertise other units. The recipient acts on `bytes`.
+        return AcceptRanges::Bytes;
+    }
+    if had_none && tokens.len() == 1 {
+        // §14.3 explicit "none" advice — single element, lowercase
+        // by example.
+        return AcceptRanges::None;
+    }
+    AcceptRanges::Other(tokens)
+}
+
+/// RFC 9110 §5.6.2 token grammar:
+///
+/// ```text
+/// token  = 1*tchar
+/// tchar  = "!" / "#" / "$" / "%" / "&" / "'" / "*"
+///        / "+" / "-" / "." / "^" / "_" / "`" / "|" / "~"
+///        / DIGIT / ALPHA
+/// ```
+fn is_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 /// Parse an `ETag` field value per RFC 9110 §8.8.3 grammar:
@@ -1303,6 +1465,18 @@ pub mod __fuzz {
     /// drive all 8 input-presence combinations.
     pub fn derive_strong_validator(etag: Option<&str>, lm: Option<&str>, date: Option<&str>) {
         let _ = super::derive_strong_validator(etag, lm, date);
+    }
+    /// Fuzz-only wrapper for [`super::parse_accept_ranges`] (RFC 9110
+    /// §14.3 `acceptable-ranges = 1#range-unit`). Returns a small
+    /// integer tag (0=Bytes, 1=None, 2=Other, 3=Absent) so the fuzzer
+    /// can drive every classification branch.
+    pub fn parse_accept_ranges(s: &str) -> u8 {
+        match super::parse_accept_ranges(s) {
+            super::AcceptRanges::Bytes => 0,
+            super::AcceptRanges::None => 1,
+            super::AcceptRanges::Other(_) => 2,
+            super::AcceptRanges::Absent => 3,
+        }
     }
 }
 
@@ -2578,5 +2752,232 @@ mod tests {
         let mut buf = [0u8; 10];
         std::io::Read::read_exact(&mut src, &mut buf).expect("read");
         assert_eq!(&buf, b"0123456789");
+    }
+
+    // -- RFC 9110 §14.3 Accept-Ranges parser ---------------------------------
+
+    #[test]
+    fn accept_ranges_bare_bytes_is_bytes() {
+        // §14.3 canonical example: `Accept-Ranges: bytes`.
+        assert_eq!(parse_accept_ranges("bytes"), AcceptRanges::Bytes);
+    }
+
+    #[test]
+    fn accept_ranges_is_case_insensitive_on_unit_name() {
+        // §3.2.6 token equality is case-insensitive; §14.1 cross-refs
+        // it. So `BYTES` and `Bytes` must both classify as bytes.
+        assert_eq!(parse_accept_ranges("BYTES"), AcceptRanges::Bytes);
+        assert_eq!(parse_accept_ranges("Bytes"), AcceptRanges::Bytes);
+        assert_eq!(parse_accept_ranges("byTeS"), AcceptRanges::Bytes);
+    }
+
+    #[test]
+    fn accept_ranges_explicit_none_is_distinct_from_absent() {
+        // §14.3 reserves `none` as the explicit-refusal token. The
+        // driver must distinguish that from "header simply absent"
+        // — the former is the server actively saying "don't try",
+        // the latter is informational silence (§14.3 makes the
+        // header advisory).
+        assert_eq!(parse_accept_ranges("none"), AcceptRanges::None);
+        assert_eq!(parse_accept_ranges("NONE"), AcceptRanges::None);
+        assert_eq!(parse_accept_ranges(""), AcceptRanges::Absent);
+        assert_eq!(parse_accept_ranges("   "), AcceptRanges::Absent);
+    }
+
+    #[test]
+    fn accept_ranges_list_with_bytes_anywhere_is_bytes() {
+        // §14.3 ABNF: `acceptable-ranges = 1#range-unit`. A list
+        // construction (RFC 9110 §5.6.1) is comma-separated with
+        // OWS tolerance. `bytes` anywhere in the list means the
+        // server supports byte ranges.
+        assert_eq!(parse_accept_ranges("bytes, foo"), AcceptRanges::Bytes);
+        assert_eq!(parse_accept_ranges("foo, bytes"), AcceptRanges::Bytes);
+        assert_eq!(parse_accept_ranges("foo,bytes,bar"), AcceptRanges::Bytes);
+        assert_eq!(
+            parse_accept_ranges("  bytes  ,  baz-units  "),
+            AcceptRanges::Bytes
+        );
+    }
+
+    #[test]
+    fn accept_ranges_unknown_units_only_is_other() {
+        // Server advertises ranges, but not in the `bytes` unit we
+        // speak. The classification carries the lowercased token
+        // list so a caller can surface what the server actually
+        // offered.
+        match parse_accept_ranges("foo-unit") {
+            AcceptRanges::Other(v) => assert_eq!(v, vec!["foo-unit"]),
+            other => panic!("expected Other, got {other:?}"),
+        }
+        match parse_accept_ranges("Foo, Bar") {
+            AcceptRanges::Other(v) => assert_eq!(v, vec!["foo", "bar"]),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accept_ranges_none_alongside_real_units_is_other_not_none() {
+        // §14.3 doesn't address the contradictory "none + bytes"
+        // sender, but does name `none` as a single-element advice
+        // value. Treat any list-form containing `none` as `Other`
+        // rather than `None` so a misconfigured server doesn't
+        // accidentally lock us out of an advertised `bytes`.
+        // (bytes-included path is covered above; here we cover the
+        // "none + other-unit" no-bytes contradiction.)
+        match parse_accept_ranges("none, foo") {
+            AcceptRanges::Other(v) => {
+                assert!(v.contains(&"none".to_string()));
+                assert!(v.contains(&"foo".to_string()));
+            }
+            other => panic!("expected Other for none+foo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accept_ranges_empty_list_elements_are_skipped() {
+        // §5.6.1 explicitly tolerates empty list members.
+        assert_eq!(parse_accept_ranges("bytes,,"), AcceptRanges::Bytes);
+        assert_eq!(parse_accept_ranges(",bytes,"), AcceptRanges::Bytes);
+        assert_eq!(parse_accept_ranges(",,,"), AcceptRanges::Absent);
+    }
+
+    #[test]
+    fn accept_ranges_non_token_elements_are_skipped_not_fatal() {
+        // A server putting garbage (containing characters illegal in
+        // a §5.6.2 token — here, a space inside what should be one
+        // token) in one slot must not black-hole the legitimate
+        // `bytes` next to it.
+        assert_eq!(
+            parse_accept_ranges("bytes, foo bar baz"),
+            AcceptRanges::Bytes
+        );
+        // Likewise, garbage-only input falls through to Absent (not
+        // a panic).
+        assert_eq!(parse_accept_ranges("hello world"), AcceptRanges::Absent);
+    }
+
+    #[test]
+    fn is_token_accepts_tchar_classes() {
+        // §5.6.2 tchar coverage spot-check.
+        assert!(is_token("bytes"));
+        assert!(is_token("foo-bar"));
+        assert!(is_token("foo.bar"));
+        assert!(is_token("ABC123"));
+        assert!(is_token("!#$%&'*+-.^_`|~"));
+        assert!(!is_token(""));
+        assert!(!is_token("foo bar"));
+        assert!(!is_token("foo,bar"));
+        assert!(!is_token("foo/bar"));
+        assert!(!is_token("\"quoted\""));
+    }
+
+    #[test]
+    fn local_server_accept_ranges_none_is_unsupported() {
+        // §14.3: `Accept-Ranges: none` is the server's explicit advice
+        // to not attempt a range request. The driver surfaces this as
+        // a distinct Unsupported error so a caller can tell it apart
+        // from "header absent" and "header advertises some other
+        // unit".
+        const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 10\r\n\
+            Accept-Ranges: none\r\n\
+            Connection: close\r\n\
+            \r\n";
+        const GET: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD, GET);
+        let err = match HttpSource::open(&uri) {
+            Ok(_) => panic!("open must refuse Accept-Ranges: none"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("explicitly refused") || msg.contains("Accept-Ranges: none"),
+            "wrong error (no §14.3 'none' refusal phrasing): {msg}"
+        );
+        assert!(msg.contains("§14.3"), "missing §14.3 cite: {msg}");
+    }
+
+    #[test]
+    fn local_server_accept_ranges_list_with_bytes_is_accepted() {
+        // §14.3 §5.6.1: a list-form Accept-Ranges that includes
+        // `bytes` legitimately advertises byte-range support. Must
+        // not be refused just because there is a second unit.
+        const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 10\r\n\
+            Accept-Ranges: bytes, foo-unit\r\n\
+            Connection: close\r\n\
+            \r\n";
+        const GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 10\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD, GET);
+        let mut src = HttpSource::open(&uri).expect("open ok");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+    }
+
+    #[test]
+    fn local_server_accept_ranges_only_unknown_unit_is_unsupported() {
+        // §14.3: server speaks ranges, just not in our unit. Surface
+        // distinctly from "none" and from "absent" — the message
+        // names the unit(s) the server actually advertised.
+        const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 10\r\n\
+            Accept-Ranges: foo-unit\r\n\
+            Connection: close\r\n\
+            \r\n";
+        const GET: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD, GET);
+        let err = match HttpSource::open(&uri) {
+            Ok(_) => panic!("open must refuse non-bytes-only"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("foo-unit") || msg.contains("not 'bytes'"),
+            "error must surface the offered unit(s): {msg}"
+        );
+        assert!(msg.contains("§14.3"), "missing §14.3 cite: {msg}");
+    }
+
+    #[test]
+    fn local_server_accept_ranges_absent_is_unsupported_distinct_message() {
+        // §14.3 makes the header advisory — but the driver's
+        // correctness model relies on the server actually satisfying
+        // Range, so we preserve the historical refusal here. The
+        // message must distinguish "absent" from "none" and from
+        // "other unit" so a caller can tell what happened.
+        const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 10\r\n\
+            Connection: close\r\n\
+            \r\n";
+        const GET: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD, GET);
+        let err = match HttpSource::open(&uri) {
+            Ok(_) => panic!("open must refuse absent Accept-Ranges"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("did not advertise") || msg.contains("Accept-Ranges"),
+            "wrong error (no absent-header phrasing): {msg}"
+        );
+        assert!(msg.contains("§14.3"), "missing §14.3 cite: {msg}");
     }
 }
