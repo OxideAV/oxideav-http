@@ -399,7 +399,25 @@ impl HttpSource {
 
         let status = head.status();
         if !status.is_success() {
-            return Err(Error::other(format!("HTTP HEAD {uri}: status {status}")));
+            // RFC 9110 §10.2.3: when sent with 503 (Service Unavailable),
+            // Retry-After indicates how long the service is expected to
+            // be unavailable; with 3xx (Redirection) responses it
+            // indicates the minimum time before a follow-up request.
+            // §10.2.3 says the field MAY also accompany 429 (RFC 6585).
+            // We surface the parsed value in the error message so a
+            // caller wiring back-off doesn't have to also fish the
+            // header out of a now-consumed response. The driver itself
+            // does NOT sleep — interpreting an absolute UTC date
+            // requires a clock the source does not own, and back-off
+            // strategy belongs in the caller.
+            let retry_after = head
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok());
+            let retry_msg = retry_after.map(format_retry_after_hint).unwrap_or_default();
+            return Err(Error::other(format!(
+                "HTTP HEAD {uri}: status {status}{retry_msg}"
+            )));
         }
         let headers = head.headers();
         let total_len = headers
@@ -602,6 +620,31 @@ impl HttpSource {
             }
         }
         if status == 206 {
+            // RFC 9110 §15.3.7.2 ("A server MUST NOT generate a multipart
+            // response to a request for a single range") + §14.6
+            // (multipart/byteranges media type). The driver only ever
+            // requests `Range: bytes=N-` (a single range), so a 206
+            // whose Content-Type is `multipart/byteranges` is a server
+            // bug. Surface a clean cite rather than letting the body
+            // surface as the binary representation type and have the
+            // §8.6 / Content-Range invariants light up downstream with
+            // confusing diagnostics: multipart bodies carry per-part
+            // Content-Range headers, the top-level Content-Range is
+            // either absent or names the synthetic outer span, and
+            // either way the demuxer would parse boundary delimiters
+            // as if they were bitstream bytes.
+            let ct_raw = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if is_multipart_byteranges_content_type(ct_raw) {
+                return Err(io::Error::other(format!(
+                    "HTTP 206 {} {}: server returned multipart/byteranges to a single-range \
+                     request (RFC 9110 §15.3.7.2 MUST NOT). Content-Type: {ct_raw:?}",
+                    self.uri, range
+                )));
+            }
             // RFC 7233 §4.2: validate the server's Content-Range echo
             // covers what we asked for and is self-consistent. A 206
             // without Content-Range, or with a multipart/byteranges
@@ -1298,6 +1341,63 @@ pub fn parse_retry_after(s: &str) -> Option<RetryAfter> {
     })
 }
 
+/// Render a `Retry-After` field value into a parenthesised hint suitable
+/// for appending to an error message — `" (Retry-After: 120 s)"` for the
+/// `delay-seconds` form, `" (Retry-After: 1999-12-31T23:59:59 UTC)"` for
+/// the HTTP-date form, `" (Retry-After: <raw>, unparseable per RFC 9110
+/// §10.2.3)"` when the field is set but does not match either grammar.
+///
+/// Returns the empty string when `raw.trim().is_empty()` so the caller
+/// can append unconditionally. The `UTC` suffix mirrors §5.6.7's "values
+/// in the asctime format are assumed to be in UTC" / "GMT" semantics
+/// — every §5.6.7 form is wall-clock UTC.
+fn format_retry_after_hint(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    match parse_retry_after(trimmed) {
+        Some(RetryAfter::Delay(d)) => format!(" (Retry-After: {} s)", d.as_secs()),
+        Some(RetryAfter::Date {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+        }) => {
+            format!(
+                " (Retry-After: {year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02} UTC)"
+            )
+        }
+        None => format!(" (Retry-After: {trimmed:?}, unparseable per RFC 9110 §10.2.3)"),
+    }
+}
+
+/// Detect a `Content-Type: multipart/byteranges[; …]` field value per
+/// RFC 9110 §14.6 / §15.3.7. The media-type proper is case-insensitive
+/// (§8.3.1: "type, subtype, and parameter name tokens are
+/// case-insensitive"); the boundary parameter is required by §14.6 but
+/// we do not need to extract it — every multipart 206 we ever see is a
+/// server bug because the driver only ever requests single-range, and
+/// §15.3.7.2 makes "A server MUST NOT generate a multipart response to
+/// a request for a single range" a hard MUST NOT.
+///
+/// Tolerant of OWS before/after the media type per §5.6.3 and of
+/// trailing `; key=value` parameters per §8.3 (we discard them — the
+/// only thing the driver acts on is the type/subtype match).
+fn is_multipart_byteranges_content_type(s: &str) -> bool {
+    let s = s.trim();
+    // §8.3 media-type ABNF: `type "/" subtype *( OWS ";" OWS parameter )`.
+    // Split off the first `;` so trailing parameters (boundary=…, etc.)
+    // don't affect the type/subtype match.
+    let media = match s.split_once(';') {
+        Some((m, _)) => m.trim_end(),
+        None => s,
+    };
+    media.eq_ignore_ascii_case("multipart/byteranges")
+}
+
 /// Convert an IMF-fixdate (already in UTC per §5.6.7 "GMT") into a
 /// strictly-monotonic 64-bit second count from a fixed epoch. Used only
 /// for the §8.8.2.2 "Date >= Last-Modified + 1 s" comparison, so any
@@ -1477,6 +1577,19 @@ pub mod __fuzz {
             super::AcceptRanges::Other(_) => 2,
             super::AcceptRanges::Absent => 3,
         }
+    }
+    /// Fuzz-only wrapper for
+    /// [`super::is_multipart_byteranges_content_type`] (RFC 9110 §8.3
+    /// + §14.6 / §15.3.7.2).
+    pub fn is_multipart_byteranges_content_type(s: &str) -> bool {
+        super::is_multipart_byteranges_content_type(s)
+    }
+    /// Fuzz-only wrapper for [`super::format_retry_after_hint`] —
+    /// exercises the RFC 9110 §10.2.3 surfacing path used by the HEAD
+    /// non-success branch. Returns the rendered hint so the fuzzer can
+    /// verify the function never panics on arbitrary input.
+    pub fn format_retry_after_hint(s: &str) -> String {
+        super::format_retry_after_hint(s)
     }
 }
 
@@ -2979,5 +3092,335 @@ mod tests {
             "wrong error (no absent-header phrasing): {msg}"
         );
         assert!(msg.contains("§14.3"), "missing §14.3 cite: {msg}");
+    }
+
+    // -------------------------------------------------------------
+    // RFC 9110 §14.6 / §15.3.7.2: multipart/byteranges media type
+    // -------------------------------------------------------------
+
+    #[test]
+    fn is_multipart_byteranges_accepts_canonical_form() {
+        assert!(is_multipart_byteranges_content_type("multipart/byteranges"));
+    }
+
+    #[test]
+    fn is_multipart_byteranges_accepts_boundary_parameter() {
+        // §14.6: the media type carries a required `boundary` parameter
+        // in real-world use; the type/subtype match must succeed
+        // regardless.
+        assert!(is_multipart_byteranges_content_type(
+            "multipart/byteranges; boundary=THIS_STRING_SEPARATES"
+        ));
+    }
+
+    #[test]
+    fn is_multipart_byteranges_is_case_insensitive_per_section_8_3_1() {
+        // §8.3.1: "type, subtype, and parameter name tokens are
+        // case-insensitive". A server that capitalises the type-name
+        // is still §14.6.
+        assert!(is_multipart_byteranges_content_type(
+            "Multipart/ByteRanges; boundary=x"
+        ));
+        assert!(is_multipart_byteranges_content_type("MULTIPART/BYTERANGES"));
+    }
+
+    #[test]
+    fn is_multipart_byteranges_tolerates_ows_around_value() {
+        // §5.6.3 OWS handling — Content-Range fields are field-content
+        // and OWS-trimmed at the parser level.
+        assert!(is_multipart_byteranges_content_type(
+            "  multipart/byteranges  "
+        ));
+        assert!(is_multipart_byteranges_content_type(
+            "multipart/byteranges ; boundary=x"
+        ));
+    }
+
+    #[test]
+    fn is_multipart_byteranges_rejects_other_types() {
+        // Negatives: the typical single-range Content-Type is the raw
+        // representation's media type. Don't false-positive on it.
+        for t in [
+            "application/pdf",
+            "video/mp4",
+            "image/jpeg",
+            "multipart/form-data; boundary=x",
+            "multipart/mixed; boundary=x",
+            "text/plain",
+            "",
+        ] {
+            assert!(
+                !is_multipart_byteranges_content_type(t),
+                "false-positive on {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_multipart_byteranges_does_not_false_positive_on_prefix_subtype() {
+        // `multipart/byteranges-foo` is NOT §14.6 even though it shares
+        // a prefix — confirm token-equality, not prefix-match.
+        assert!(!is_multipart_byteranges_content_type(
+            "multipart/byteranges-foo"
+        ));
+    }
+
+    #[test]
+    fn local_server_206_with_multipart_byteranges_is_rejected() {
+        // §15.3.7.2: "A server MUST NOT generate a multipart response
+        // to a request for a single range." We only ever ask for one
+        // range. A 206 carrying Content-Type: multipart/byteranges is a
+        // server bug; surface a clean §15.3.7 cite rather than letting
+        // the body's boundary delimiter sneak into the demuxer's
+        // bitstream view.
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 10\r\n\
+            Content-Type: multipart/byteranges; boundary=THIS_STRING_SEPARATES\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open ok");
+        let mut buf = [0u8; 10];
+        let err = std::io::Read::read_exact(&mut src, &mut buf).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("multipart/byteranges"),
+            "error must name the offending media type: {msg}"
+        );
+        assert!(msg.contains("§15.3.7"), "error must cite §15.3.7: {msg}");
+    }
+
+    #[test]
+    fn local_server_206_with_uppercase_multipart_byteranges_is_rejected() {
+        // §8.3.1 case-insensitivity: an origin that title-cases the
+        // media type must still be detected as §15.3.7.2-illegal.
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 10\r\n\
+            Content-Type: Multipart/ByteRanges; boundary=x\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open ok");
+        let mut buf = [0u8; 10];
+        let err = std::io::Read::read_exact(&mut src, &mut buf).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("multipart/byteranges") || msg.contains("Multipart/ByteRanges"),
+            "error must name the offending media type: {msg}"
+        );
+    }
+
+    #[test]
+    fn local_server_206_with_video_mp4_content_type_is_accepted() {
+        // Sanity: a 206 with the raw representation media type must
+        // still succeed — only multipart/byteranges flips the new
+        // §15.3.7.2 guard.
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 10\r\n\
+            Content-Type: video/mp4\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open ok");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+    }
+
+    // -------------------------------------------------------------
+    // RFC 9110 §10.2.3: Retry-After surfacing on HEAD non-success
+    // -------------------------------------------------------------
+
+    #[test]
+    fn format_retry_after_hint_renders_delay_seconds_form() {
+        let h = format_retry_after_hint("120");
+        assert_eq!(h, " (Retry-After: 120 s)");
+    }
+
+    #[test]
+    fn format_retry_after_hint_renders_zero_delay() {
+        let h = format_retry_after_hint("0");
+        assert_eq!(h, " (Retry-After: 0 s)");
+    }
+
+    #[test]
+    fn format_retry_after_hint_renders_imf_fixdate_form() {
+        // §10.2.3 canonical example.
+        let h = format_retry_after_hint("Fri, 31 Dec 1999 23:59:59 GMT");
+        assert_eq!(h, " (Retry-After: 1999-12-31T23:59:59 UTC)");
+    }
+
+    #[test]
+    fn format_retry_after_hint_renders_rfc850_form_uniformly() {
+        // §5.6.7 MUST-accept the obsolete form. The rendered hint must
+        // canonicalise to the same ISO-8601-ish surface so the caller
+        // gets a stable shape regardless of which form the origin used.
+        let h = format_retry_after_hint("Sunday, 06-Nov-94 08:49:37 GMT");
+        // Year 1994 wraps under the §5.6.7 sliding window from `94`.
+        assert!(
+            h.contains("1994-11-06T08:49:37 UTC"),
+            "rfc850 canonicalisation: {h}"
+        );
+    }
+
+    #[test]
+    fn format_retry_after_hint_renders_asctime_form_uniformly() {
+        let h = format_retry_after_hint("Sun Nov  6 08:49:37 1994");
+        assert!(
+            h.contains("1994-11-06T08:49:37 UTC"),
+            "asctime canonicalisation: {h}"
+        );
+    }
+
+    #[test]
+    fn format_retry_after_hint_surfaces_unparseable_value() {
+        // §10.2.3 grammar is strict — a unit-bearing form is rejected
+        // by parse_retry_after. The hint helper should still produce a
+        // diagnostic that names the raw value and the §10.2.3 cite so
+        // the caller can see the origin's bug rather than a silent
+        // "no Retry-After hint".
+        let h = format_retry_after_hint("Tomorrow at noon");
+        assert!(h.contains("Tomorrow at noon"), "unparseable hint: {h}");
+        assert!(h.contains("unparseable"), "no diagnostic: {h}");
+        assert!(h.contains("§10.2.3"), "no cite: {h}");
+    }
+
+    #[test]
+    fn format_retry_after_hint_skips_empty_input() {
+        // Sentinel: an empty / whitespace-only value collapses to "",
+        // so the caller's `format!("status {status}{hint}")` does not
+        // emit a parenthesised empty.
+        assert_eq!(format_retry_after_hint(""), "");
+        assert_eq!(format_retry_after_hint("   "), "");
+        assert_eq!(format_retry_after_hint("\t"), "");
+    }
+
+    #[test]
+    fn format_retry_after_hint_trims_surrounding_ows() {
+        // §5.6.3 OWS — leading/trailing horizontal whitespace is field
+        // framing, not value semantics.
+        let h = format_retry_after_hint("  120  ");
+        assert_eq!(h, " (Retry-After: 120 s)");
+    }
+
+    /// Spawn a minimal HEAD-only server that always returns
+    /// `head_resp`. Used by the §10.2.3 Retry-After tests which never
+    /// reach the GET stage.
+    fn spawn_head_only(head_resp: &'static [u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                use std::io::Read as _;
+                let _ = stream.read(&mut buf).unwrap_or(0);
+                let _ = stream.write_all(head_resp);
+                let _ = stream.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}/x")
+    }
+
+    #[test]
+    fn local_server_head_503_surfaces_retry_after_delay() {
+        // §10.2.3: "When sent with a 503 (Service Unavailable)
+        // response, Retry-After indicates how long the service is
+        // expected to be unavailable to the requesting client." The
+        // HEAD non-success branch must surface the parsed delay so the
+        // caller wiring back-off doesn't have to refetch the header.
+        const HEAD: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\
+            Content-Length: 0\r\n\
+            Retry-After: 120\r\n\
+            Connection: close\r\n\
+            \r\n";
+        let uri = spawn_head_only(HEAD);
+        let err = match HttpSource::open(&uri) {
+            Ok(_) => panic!("503 must error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("503"), "wrong error (no 503): {msg}");
+        assert!(
+            msg.contains("Retry-After: 120 s"),
+            "Retry-After delay must surface in the message: {msg}"
+        );
+    }
+
+    #[test]
+    fn local_server_head_429_surfaces_retry_after_date() {
+        // §10.2.3 also accompanies 429 (Too Many Requests, RFC 6585)
+        // with a Retry-After. Test the HTTP-date form alongside the
+        // delay-seconds form.
+        const HEAD: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\n\
+            Content-Length: 0\r\n\
+            Retry-After: Fri, 31 Dec 1999 23:59:59 GMT\r\n\
+            Connection: close\r\n\
+            \r\n";
+        let uri = spawn_head_only(HEAD);
+        let err = match HttpSource::open(&uri) {
+            Ok(_) => panic!("429 must error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("429"), "wrong error (no 429): {msg}");
+        assert!(
+            msg.contains("1999-12-31T23:59:59 UTC"),
+            "Retry-After date must surface canonicalised in the message: {msg}"
+        );
+    }
+
+    #[test]
+    fn local_server_head_503_without_retry_after_omits_hint() {
+        // Sentinel: a 503 with no Retry-After must NOT carry a
+        // parenthesised empty hint. The error stays "status 503" as
+        // before.
+        const HEAD: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\
+            Content-Length: 0\r\n\
+            Connection: close\r\n\
+            \r\n";
+        let uri = spawn_head_only(HEAD);
+        let err = match HttpSource::open(&uri) {
+            Ok(_) => panic!("503 must error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("503"), "wrong error (no 503): {msg}");
+        assert!(
+            !msg.contains("Retry-After"),
+            "must not emit a Retry-After hint when none was sent: {msg}"
+        );
+    }
+
+    #[test]
+    fn local_server_head_503_with_malformed_retry_after_surfaces_diagnostic() {
+        // §10.2.3 grammar is strict — "soon" matches neither
+        // delay-seconds nor any HTTP-date form. The hint must surface
+        // the raw value + the §10.2.3 cite so the caller can see the
+        // origin's bug rather than silently dropping the field.
+        const HEAD: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\
+            Content-Length: 0\r\n\
+            Retry-After: soon\r\n\
+            Connection: close\r\n\
+            \r\n";
+        let uri = spawn_head_only(HEAD);
+        let err = match HttpSource::open(&uri) {
+            Ok(_) => panic!("503 must error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("\"soon\"") && msg.contains("unparseable"),
+            "malformed Retry-After must surface raw + diagnostic: {msg}"
+        );
+        assert!(msg.contains("§10.2.3"), "missing §10.2.3 cite: {msg}");
     }
 }

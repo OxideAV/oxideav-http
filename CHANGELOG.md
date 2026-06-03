@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- RFC 9110 §15.3.7.2 + §14.6 + §8.3 `multipart/byteranges` rejection on
+  a 206 response. The driver only ever sends `Range: bytes=N-`
+  (single-range), and §15.3.7.2 makes "A server MUST NOT generate a
+  multipart response to a request for a single range" a hard MUST NOT.
+  New helper `is_multipart_byteranges_content_type` consults the 206's
+  `Content-Type` field before the §4.2 `Content-Range` checks; on
+  match, the read fails with a §15.3.7.2 cite that names the offending
+  media type. The match is case-insensitive per §8.3.1 ("type, subtype,
+  and parameter name tokens are case-insensitive") and tolerant of
+  trailing `; boundary=…` parameters. Without this guard, the body's
+  multipart framing would be parsed as bitstream bytes by the
+  downstream demuxer (the §8.6 Content-Length cross-check from r197
+  would also light up, but with a misleading diagnostic). 6 new
+  helper unit tests (canonical, boundary-bearing, case-insensitive,
+  OWS-tolerant, every-non-multipart-type sentinel, prefix-subtype
+  non-match) + 3 new local-TCP end-to-end tests (canonical-multipart,
+  title-cased-multipart, video/mp4 sanity-passes).
+- RFC 9110 §10.2.3 `Retry-After` surfacing on HEAD non-success. New
+  helper `format_retry_after_hint(raw) -> String` consumes the field
+  through the existing `parse_retry_after` and renders a
+  parenthesised hint suitable for appending to an error message —
+  `" (Retry-After: 120 s)"` for the `delay-seconds` form,
+  `" (Retry-After: 1999-12-31T23:59:59 UTC)"` for any of the three
+  §5.6.7 HTTP-date forms (canonicalised — the caller gets a stable
+  shape regardless of which wire form the origin emitted), and
+  `" (Retry-After: \"…\", unparseable per RFC 9110 §10.2.3)"` when
+  the field is set but does not match either grammar. The HEAD
+  non-success branch in `open_impl` now parses any `Retry-After`
+  header and surfaces the hint in the resulting `Error::other`
+  message — covering the §10.2.3-named 503 (Service Unavailable) +
+  3xx (Redirection) cases plus the RFC 6585 429 (Too Many Requests)
+  case §10.2.3 also mentions. The driver still does NOT itself sleep
+  on the value (interpreting "wait until this absolute UTC time"
+  requires a clock the source does not own); the surfacing just
+  spares the caller from refetching a now-consumed header. 9 new
+  helper unit tests (delay-seconds, zero-delay, IMF-fixdate,
+  rfc850-date canonicalisation, asctime canonicalisation,
+  unparseable diagnostic + cite, empty / whitespace-only collapse,
+  OWS-trimming) + 4 new local-TCP end-to-end tests (503 with delay,
+  429 with date, 503 without Retry-After omits the hint, 503 with
+  unparseable Retry-After surfaces the §10.2.3 cite).
+- Fuzz harness gains 2 new wrappers
+  (`is_multipart_byteranges_content_type`,
+  `format_retry_after_hint`) and 3 new seed-corpus entries
+  (`multipart_byteranges_bare`, `multipart_byteranges_boundary`,
+  `content_type_video_mp4`).
+
 - RFC 9110 §14.3 `Accept-Ranges` parser + classifier. The HEAD path now
   consumes `Accept-Ranges` as the §14.3 ABNF `acceptable-ranges =
   1#range-unit` list (§5.6.1 list constructor, OWS-tolerant, empty

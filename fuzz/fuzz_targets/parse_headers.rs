@@ -36,6 +36,10 @@
 //! * `parse_accept_ranges` — RFC 9110 §14.3 `acceptable-ranges =
 //!   1#range-unit` list-form classifier (Bytes / None / Other /
 //!   Absent).
+//! * `is_multipart_byteranges_content_type` — RFC 9110 §8.3
+//!   media-type / §14.6 / §15.3.7.2 single-range MUST-NOT detector.
+//! * `format_retry_after_hint` — RFC 9110 §10.2.3 surfacing helper
+//!   exercised on the HEAD non-success branch.
 //! * `derive_strong_validator` — §13.1.5 + §8.8.2.2 + §8.8.3
 //!   composite that picks an If-Range value from a HEAD's three
 //!   relevant headers.
@@ -55,6 +59,8 @@ fuzz_target!(|data: &[u8]| {
         let _ = __fuzz::parse_http_date(s);
         let _ = __fuzz::parse_retry_after(s);
         let _ = __fuzz::parse_accept_ranges(s);
+        let _ = __fuzz::is_multipart_byteranges_content_type(s);
+        let _ = __fuzz::format_retry_after_hint(s);
     }
 
     // Pass 2: NUL-split the input into up to three fields for the

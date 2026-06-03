@@ -104,6 +104,14 @@ Every 206 (Partial Content) response is validated against RFC 7233
   the server doesn't know the total).
 - `bytes */N` unsatisfied-range payloads are rejected on a 206 (they
   are a 416 payload, never a 206 payload).
+- `Content-Type: multipart/byteranges` (RFC 9110 §14.6) is rejected
+  with a §15.3.7.2 cite. The driver only ever issues
+  `Range: bytes=N-` (single-range), and §15.3.7.2 makes "A server
+  MUST NOT generate a multipart response to a request for a single
+  range" a hard MUST NOT — surfacing the offence cleanly stops the
+  boundary delimiter from being interpreted as bitstream bytes. The
+  media-type match is case-insensitive per §8.3.1 and tolerant of
+  trailing parameters (`; boundary=...`).
 
 If a server ignores the `Range` header and responds with `200 OK`
 plus the full body (§3.1 permits this), the prefix `[0, self.pos)`
@@ -214,6 +222,23 @@ parser is exported so consumers that *do* hold both can act on
 503 / 429 / 3xx-with-Retry-After responses without writing the
 §10.2.3 grammar a second time.
 
+When the opening `HEAD` returns a non-success status, the driver
+parses any `Retry-After` field through `parse_retry_after` and
+surfaces the canonicalised value in the resulting error message:
+
+- `delay-seconds` form renders as `" (Retry-After: <N> s)"`.
+- HTTP-date form renders as
+  `" (Retry-After: YYYY-MM-DDTHH:MM:SS UTC)"` regardless of which
+  of the three §5.6.7 wire forms the server emitted.
+- An unparseable `Retry-After` surfaces the raw value plus a
+  §10.2.3 cite (`"Retry-After: \"…\", unparseable per RFC 9110
+  §10.2.3"`) so a buggy origin is visible rather than silently
+  dropped.
+
+This lets a caller wiring back-off act on the message text alone
+without having to also fish the header out of a now-consumed
+response.
+
 The §10.2.3 grammar is intentionally strict:
 
 - `delay-seconds` is 1*DIGIT — a leading `+` or `-`, fractional
@@ -234,7 +259,10 @@ every internal response-header parser used by the source driver —
 `parse_imf_fixdate` / `parse_rfc850_date` / `parse_asctime_date`
 plus the unified §5.6.7 dispatcher `parse_http_date`,
 `parse_retry_after` (§10.2.3),
-`parse_accept_ranges` (§14.3), and the composite
+`parse_accept_ranges` (§14.3),
+`is_multipart_byteranges_content_type` (§8.3 / §14.6 / §15.3.7.2),
+`format_retry_after_hint` (§10.2.3 HEAD surfacing helper),
+and the composite
 `derive_strong_validator` (§13.1.5 + §8.8.2.2 + §8.8.3).
 The harness
 reaches the parsers through a `#[doc(hidden)] pub mod __fuzz`
