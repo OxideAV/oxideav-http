@@ -22,4 +22,11 @@ fuzz = []
 [dependencies]
 oxideav-core = "0.1"
 oxideav-source = "0.1"
-ureq = "3"
+# default-features turned off so that the transport's `gzip` / `brotli`
+# auto-decompress shims are NOT in effect. RFC 9110 §8.4 requires us to
+# surface a non-identity Content-Encoding to the caller — a transparently
+# decompressed body would arrive without that header and with a
+# Content-Length that no longer matches the bytes we read, defeating the
+# byte-offset contract the source driver promises a demuxer. We keep
+# the rustls TLS backend on so `https://` continues to work.
+ureq = { version = "3", default-features = false, features = ["rustls"] }

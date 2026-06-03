@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- RFC 9110 §8.4 `Content-Encoding` rejection on every response path.
+  - Every `HEAD` and every range `GET` now sends
+    `Accept-Encoding: identity` (§12.5.3), telling the origin we cannot
+    accept compressed octets behind a `Content-Length` /
+    `Content-Range` that would no longer correspond to media byte
+    offsets.
+  - A new internal `parse_content_encoding(Option<&str>) ->
+    ContentEncodingState` classifies the response field per §8.4 +
+    §5.6.1: absent header, all-empty list elements, and the reserved
+    `identity` token (alone or mixed with empties) all classify as
+    `Identity`; any other §5.6.2 token (`gzip`, `compress`, `deflate`,
+    `br`, `zstd`, `x-gzip`, …) and any malformed list element
+    (containing non-`tchar` characters) classify as `NonIdentity`,
+    carrying the original field value verbatim into the error surface.
+  - All three response paths now reject `NonIdentity`:
+    - Opening `HEAD` returns `Error::Unsupported` with the field
+      value + §8.4 cite.
+    - 200-fallback (§3.1) GET returns `io::Error::other` before any
+      prefix-drain.
+    - 206 GET returns `io::Error::other` before any byte reaches the
+      reader.
+  - 14 new unit tests cover the parser (absent, identity-only,
+    case-insensitivity, empty-list-element tolerance, named
+    compression codings — including spec-named `compress` / `deflate`
+    / `gzip` and registry-listed `br` / `zstd` — list with any
+    non-identity member, list of only identity tokens, OWS
+    whitespace, non-token characters including non-ASCII, total-on-
+    arbitrary-input smoke test) plus `is_token` boundary coverage.
+  - 4 new local-TCP end-to-end tests cover the wire path: HEAD with
+    `Content-Encoding: gzip` rejected at open, HEAD with explicit
+    `identity` accepted, 206 with `Content-Encoding: gzip` rejected
+    on read, 200-fallback with `Content-Encoding: deflate` rejected
+    on read, and 206 with explicit `identity` accepted.
+  - Fuzz harness gains a `parse_content_encoding` wrapper driving
+    both the `Some(_)` and the `None` arms, plus three new seed
+    corpus entries (`content_encoding_identity`, `content_encoding_gzip`,
+    `content_encoding_list`).
 - RFC 9110 §10.2.3 `Retry-After` header parser. New public
   `parse_retry_after(&str) -> Option<RetryAfter>` consumes the
   `HTTP-date / delay-seconds` grammar and returns a typed

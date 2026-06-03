@@ -33,6 +33,11 @@
 //!   three forms in turn.
 //! * `parse_retry_after` — RFC 9110 §10.2.3 `HTTP-date /
 //!   delay-seconds` grammar for the `Retry-After` field.
+//! * `parse_content_encoding` — RFC 9110 §8.4 + §5.6.1
+//!   `Content-Encoding = #content-coding` field, classified into
+//!   "identity-equivalent" vs "names a non-identity coding". Both
+//!   the `None` (header absent) and the `Some(_)` (header present)
+//!   arms are exercised.
 //! * `derive_strong_validator` — §13.1.5 + §8.8.2.2 + §8.8.3
 //!   composite that picks an If-Range value from a HEAD's three
 //!   relevant headers.
@@ -51,6 +56,11 @@ fuzz_target!(|data: &[u8]| {
         let _ = __fuzz::parse_asctime_date(s);
         let _ = __fuzz::parse_http_date(s);
         let _ = __fuzz::parse_retry_after(s);
+        // Also drive the explicit-absent (None) arm so the panic
+        // contract covers both presence states. Fold the boolean
+        // through so the compiler can't optimise the call away.
+        let _ = __fuzz::parse_content_encoding(Some(s));
+        let _ = __fuzz::parse_content_encoding(None);
     }
 
     // Pass 2: NUL-split the input into up to three fields for the

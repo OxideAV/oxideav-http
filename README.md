@@ -154,6 +154,35 @@ never silently re-anchors against a different resource. When no
 `If-Range` was sent (no strong validator at HEAD), the §3.1
 prefix-drain fallback still applies unchanged.
 
+## RFC 9110 §8.4 Content-Encoding rejection
+
+Every request the driver issues (`HEAD` at construction, range `GET`s on
+read) carries `Accept-Encoding: identity` and the corresponding response
+is rejected if it nevertheless advertises a non-`identity`
+`Content-Encoding`:
+
+- `Content-Length` and `Content-Range` describe *compressed* octets when
+  a content coding is applied, so the file-offset view a demuxer
+  reads against would no longer correspond to the underlying media's
+  byte positions. We do not transparently decompress on the way in;
+  a 206 `bytes 0-9/10` of a gzip representation would yield ten octets
+  of compressed prefix, not ten octets of media — surfacing that as
+  a fatal error is the only safe response.
+- §8.4 reserves the token `identity` for Accept-Encoding and SHOULDs
+  servers not to include it in `Content-Encoding`; we accept it
+  regardless (it means "no coding applied", per §5.6.1 list semantics).
+- §5.6.1.2 empty list elements (`Content-Encoding: ,` or
+  `Content-Encoding: identity, ,`) are tolerated.
+- Any other non-empty §5.6.2 token (`gzip`, `compress`, `deflate`,
+  `br`, `zstd`, `x-gzip`, …), and any malformed list whose element is
+  not a §5.6.2 token, error with `Error::Unsupported` at open (HEAD
+  path) or `io::Error` on the next read (200-fallback / 206 path).
+  Both error messages name the field value verbatim and cite §8.4.
+
+The check applies on all three response paths — the opening `HEAD`,
+the §3.1 200-fallback, and every 206 — so a coding sneaked in by an
+intermediate cache after construction is caught on the next read.
+
 ## Retry-After parsing (RFC 9110 §10.2.3)
 
 The free function `parse_retry_after` consumes a `Retry-After`
@@ -204,8 +233,10 @@ every internal response-header parser used by the source driver —
 `parse_byte_unsatisfied_range` (§14.4), `parse_entity_tag` (§8.8.3),
 `parse_imf_fixdate` / `parse_rfc850_date` / `parse_asctime_date`
 plus the unified §5.6.7 dispatcher `parse_http_date`,
-`parse_retry_after` (§10.2.3), and the composite
-`derive_strong_validator` (§13.1.5 + §8.8.2.2 + §8.8.3).
+`parse_retry_after` (§10.2.3), `parse_content_encoding` (§8.4 +
+§5.6.1 — both the `Some(_)` present arm and the `None` absent arm
+are driven), and the composite `derive_strong_validator`
+(§13.1.5 + §8.8.2.2 + §8.8.3).
 The harness
 reaches the parsers through a `#[doc(hidden)] pub mod __fuzz`
 re-export gated on the `fuzz` cargo feature, so the stable public

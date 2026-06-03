@@ -392,8 +392,15 @@ impl HttpSource {
 
     fn open_impl(uri: &str, scoped: Option<Agent>) -> Result<Self> {
         let head_agent: &Agent = scoped.as_ref().unwrap_or_else(|| agent());
+        // RFC 9110 §8.4 + §12.5.3: ask the origin not to apply any
+        // content coding. `Content-Length` and byte-range offsets only
+        // describe the representation when no coding is in effect; an
+        // origin that responds with `Content-Encoding: gzip` (etc.)
+        // would otherwise have us reading compressed octets while
+        // labelling them as media-byte offsets.
         let head = head_agent
             .head(uri)
+            .header("Accept-Encoding", "identity")
             .call()
             .map_err(|e| Error::other(format!("HTTP HEAD {uri}: {e}")))?;
 
@@ -402,6 +409,22 @@ impl HttpSource {
             return Err(Error::other(format!("HTTP HEAD {uri}: status {status}")));
         }
         let headers = head.headers();
+        // RFC 9110 §8.4: a non-identity `Content-Encoding` makes byte
+        // offsets meaningless for our purposes. We rejected the
+        // coding via `Accept-Encoding: identity` on the request side;
+        // a server that nevertheless applies one is misbehaving and
+        // we surface that rather than silently letting compressed
+        // octets reach a demuxer that expects raw representation
+        // bytes.
+        let ce_raw = headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok());
+        if let ContentEncodingState::NonIdentity(raw) = parse_content_encoding(ce_raw) {
+            return Err(Error::Unsupported(format!(
+                "HTTP HEAD {uri}: response carries non-identity Content-Encoding '{raw}' \
+                 — byte-range semantics do not apply (RFC 9110 §8.4)"
+            )));
+        }
         let total_len = headers
             .get("content-length")
             .and_then(|v| v.to_str().ok())
@@ -473,7 +496,14 @@ impl HttpSource {
         // re-anchor the byte offset against a different representation.
         let if_range = self.validator.as_ref().map(|v| v.as_if_range().to_owned());
         let sent_if_range = if_range.is_some();
-        let mut req = self.agent_ref().get(&self.uri).header("Range", &range);
+        // RFC 9110 §8.4: send `Accept-Encoding: identity` on every GET
+        // for the same reason as HEAD — content-encoded bodies have
+        // no usable byte-offset relation to the underlying media.
+        let mut req = self
+            .agent_ref()
+            .get(&self.uri)
+            .header("Range", &range)
+            .header("Accept-Encoding", "identity");
         if let Some(ref v) = if_range {
             req = req.header("If-Range", v.as_str());
         }
@@ -552,6 +582,27 @@ impl HttpSource {
             .get("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
+        // RFC 9110 §8.4: validate the GET response's Content-Encoding
+        // for the same reason as on HEAD. We asked for
+        // `Accept-Encoding: identity`; a server that nevertheless
+        // applies a coding has put compressed octets behind a
+        // `Content-Length` and (on 206) a `Content-Range` whose byte
+        // positions do not relate to the media offsets the demuxer
+        // wants. Both 200-fallback and 206 paths are covered — the
+        // 416 path is already an error before any body is read.
+        let ce_raw = resp
+            .headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        if let ContentEncodingState::NonIdentity(raw) = parse_content_encoding(ce_raw.as_deref()) {
+            return Err(io::Error::other(format!(
+                "HTTP {} {} {}: response carries non-identity \
+                 Content-Encoding '{raw}' — byte-range semantics do \
+                 not apply (RFC 9110 §8.4)",
+                status, self.uri, range
+            )));
+        }
         // Per RFC 7233 §3.1, a server that does not support (or chooses
         // to ignore) Range MAY answer a range request with a full 200
         // response. In that case we must drop the prefix [0, self.pos)
@@ -1197,6 +1248,99 @@ fn derive_strong_validator(
     None
 }
 
+/// Outcome of parsing a `Content-Encoding` field value per RFC 9110
+/// §8.4 + §5.6.1.
+///
+/// The driver requests `Accept-Encoding: identity` on every HEAD and
+/// GET and rejects any response that nevertheless carries a
+/// non-identity content coding — `Content-Length` and byte-range
+/// offsets in that case describe the compressed octets, not the
+/// representation a downstream demuxer wants to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContentEncodingState {
+    /// Either the header was absent, every list element was empty
+    /// (§5.6.1's "empty elements do not contribute"), or the only
+    /// element present was the reserved `identity` token. All three
+    /// mean "no content coding has been applied" — the body's byte
+    /// offsets correspond 1:1 to the representation.
+    Identity,
+    /// At least one non-`identity` coding is named, or one of the
+    /// elements failed §5.6.2 token validation. We carry the field
+    /// value verbatim into the error message so the caller can see
+    /// what the origin actually claimed.
+    NonIdentity(String),
+}
+
+/// Parse a `Content-Encoding` field value per RFC 9110 §8.4 + §5.6.1.
+///
+/// `Content-Encoding = #content-coding`; `content-coding = token`
+/// (§8.4.1). Per §5.6.1.2 a recipient MUST tolerate a reasonable number
+/// of empty list elements (the "merged values" case) — we accept any
+/// count, since the upper bound is "DoS-only" guidance that the wire
+/// already enforces via header-size limits.
+///
+/// Returns:
+/// * `Identity` when the header is absent (`None`), when every
+///   comma-separated element is empty after OWS-trim, or when the only
+///   non-empty element is the case-insensitive token `identity`.
+///   §8.4 reserves `identity` for Accept-Encoding's special role and
+///   SHOULDs servers not to list it in Content-Encoding, but a server
+///   that does is still naming "no coding applied" and we accept it.
+/// * `NonIdentity(_)` whenever any element is a non-empty token that
+///   isn't `identity` (case-insensitive), OR any element contains a
+///   character outside the §5.6.2 `tchar` set. The variant carries the
+///   original (untrimmed) field value for error-surface use.
+fn parse_content_encoding(raw: Option<&str>) -> ContentEncodingState {
+    let Some(raw) = raw else {
+        return ContentEncodingState::Identity;
+    };
+    let mut saw_non_identity = false;
+    for elem in raw.split(',') {
+        let trimmed = elem.trim_matches(|c: char| c == ' ' || c == '\t');
+        if trimmed.is_empty() {
+            // §5.6.1.2: "Empty elements do not contribute to the count
+            // of elements present" — skip them, but don't reject.
+            continue;
+        }
+        // §5.6.2 token check. Any non-tchar (or non-ASCII byte) is a
+        // malformed coding name; we treat it as "something other than
+        // identity is being declared" rather than silently passing
+        // the body through.
+        if !is_token(trimmed) {
+            saw_non_identity = true;
+            continue;
+        }
+        if !trimmed.eq_ignore_ascii_case("identity") {
+            saw_non_identity = true;
+        }
+    }
+    if saw_non_identity {
+        ContentEncodingState::NonIdentity(raw.to_owned())
+    } else {
+        ContentEncodingState::Identity
+    }
+}
+
+/// True iff `s` is a non-empty RFC 9110 §5.6.2 token
+/// (`1*tchar` where `tchar` is the permitted VCHAR subset).
+fn is_token(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(is_tchar)
+}
+
+/// True iff `b` matches the §5.6.2 `tchar` production.
+fn is_tchar(b: u8) -> bool {
+    // tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*"
+    //       / "+" / "-" / "." / "^" / "_" / "`" / "|" / "~"
+    //       / DIGIT / ALPHA
+    matches!(b,
+        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*'
+        | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+        | b'0'..=b'9'
+        | b'A'..=b'Z'
+        | b'a'..=b'z'
+    )
+}
+
 impl Read for HttpSource {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() {
@@ -1303,6 +1447,17 @@ pub mod __fuzz {
     /// drive all 8 input-presence combinations.
     pub fn derive_strong_validator(etag: Option<&str>, lm: Option<&str>, date: Option<&str>) {
         let _ = super::derive_strong_validator(etag, lm, date);
+    }
+    /// Fuzz-only wrapper for [`super::parse_content_encoding`] (RFC
+    /// 9110 §8.4 + §5.6.1). Returns `true` when the parser says the
+    /// field amounts to "no coding applied" (absent header, all-empty
+    /// list elements, or the reserved `identity` token alone), `false`
+    /// for any non-identity outcome.
+    pub fn parse_content_encoding(s: Option<&str>) -> bool {
+        matches!(
+            super::parse_content_encoding(s),
+            super::ContentEncodingState::Identity
+        )
     }
 }
 
@@ -2570,6 +2725,304 @@ mod tests {
         static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
             Content-Length: 10\r\n\
             Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+    }
+
+    // -- RFC 9110 §8.4 Content-Encoding ---------------------------------------
+
+    #[test]
+    fn content_encoding_absent_header_is_identity() {
+        // No header at all → §8.4 says "no codings have been applied".
+        assert_eq!(parse_content_encoding(None), ContentEncodingState::Identity);
+    }
+
+    #[test]
+    fn content_encoding_identity_token_is_identity() {
+        // §8.4: identity is reserved for Accept-Encoding's special role
+        // and SHOULD NOT be listed, but a server that does list it
+        // alone is still naming "no encoding applied".
+        assert_eq!(
+            parse_content_encoding(Some("identity")),
+            ContentEncodingState::Identity
+        );
+        // Case-insensitive token comparison per §5.6.2 / §8.4.1.
+        assert_eq!(
+            parse_content_encoding(Some("Identity")),
+            ContentEncodingState::Identity
+        );
+        assert_eq!(
+            parse_content_encoding(Some("IDENTITY")),
+            ContentEncodingState::Identity
+        );
+    }
+
+    #[test]
+    fn content_encoding_empty_list_elements_are_skipped() {
+        // §5.6.1.2: "Empty elements do not contribute to the count of
+        // elements present" — a recipient MUST tolerate them.
+        for raw in ["", ",", " ,  ", ",,,", "\t , \t , \t"] {
+            assert_eq!(
+                parse_content_encoding(Some(raw)),
+                ContentEncodingState::Identity,
+                "raw='{raw}' should classify as Identity"
+            );
+        }
+    }
+
+    #[test]
+    fn content_encoding_gzip_is_non_identity() {
+        // §8.4.1.3 gzip is one of the named compression codings; if it
+        // shows up in a response we did NOT solicit, we have to reject
+        // before the demuxer reads compressed octets.
+        match parse_content_encoding(Some("gzip")) {
+            ContentEncodingState::NonIdentity(raw) => assert_eq!(raw, "gzip"),
+            other => panic!("expected NonIdentity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn content_encoding_named_compressions_are_all_non_identity() {
+        // Spec-named codings from §8.4.1: compress (.1.1), deflate
+        // (.1.2), gzip (.1.3). Plus `br` (RFC 7932) registered in the
+        // §16.6 HTTP Content Coding Registry. All MUST surface as
+        // NonIdentity.
+        for tok in ["compress", "deflate", "gzip", "x-gzip", "br", "zstd"] {
+            assert!(
+                matches!(
+                    parse_content_encoding(Some(tok)),
+                    ContentEncodingState::NonIdentity(_)
+                ),
+                "token '{tok}' should be NonIdentity"
+            );
+        }
+    }
+
+    #[test]
+    fn content_encoding_list_with_any_non_identity_member_is_non_identity() {
+        // §8.4: senders MUST list codings in the order applied. A
+        // list with even one non-identity coding has touched the body
+        // and must be rejected.
+        assert!(matches!(
+            parse_content_encoding(Some("identity, gzip")),
+            ContentEncodingState::NonIdentity(_)
+        ));
+        assert!(matches!(
+            parse_content_encoding(Some("gzip, identity")),
+            ContentEncodingState::NonIdentity(_)
+        ));
+        assert!(matches!(
+            parse_content_encoding(Some("deflate, gzip")),
+            ContentEncodingState::NonIdentity(_)
+        ));
+    }
+
+    #[test]
+    fn content_encoding_list_of_only_identity_tokens_is_identity() {
+        // Pathological but spec-tolerable: an origin that lists
+        // identity multiple times is still saying "no coding applied".
+        assert_eq!(
+            parse_content_encoding(Some("identity, identity")),
+            ContentEncodingState::Identity
+        );
+        assert_eq!(
+            parse_content_encoding(Some(" identity , identity ")),
+            ContentEncodingState::Identity
+        );
+    }
+
+    #[test]
+    fn content_encoding_ows_around_each_element_is_trimmed() {
+        // §5.6.1 lists are OWS-permissive around the comma separator.
+        for raw in [
+            " gzip ",
+            "\tgzip\t",
+            "  gzip  ,  ",
+            "  ,  gzip  ",
+            "identity ,  gzip",
+        ] {
+            assert!(
+                matches!(
+                    parse_content_encoding(Some(raw)),
+                    ContentEncodingState::NonIdentity(_)
+                ),
+                "OWS-trim should not change classification of '{raw}'"
+            );
+        }
+    }
+
+    #[test]
+    fn content_encoding_non_token_chars_are_treated_as_non_identity() {
+        // A §5.6.2 token rejects whitespace inside, quotes, and any
+        // delimiter character. Such a "coding" cannot be `identity`,
+        // and we err on the side of caution: surface as NonIdentity
+        // so a demuxer never silently consumes a payload we cannot
+        // classify.
+        for raw in [
+            "\"gzip\"",
+            "gz ip",
+            "id;q=1",
+            "identity;q=0",
+            "iden\u{00e9}tity", // 'é' — bytes 0xC3 0xA9 fall outside tchar
+        ] {
+            assert!(
+                matches!(
+                    parse_content_encoding(Some(raw)),
+                    ContentEncodingState::NonIdentity(_)
+                ),
+                "malformed token '{raw}' should be NonIdentity"
+            );
+        }
+    }
+
+    #[test]
+    fn content_encoding_classifier_is_total_on_arbitrary_bytes() {
+        // Smoke-test the parser doesn't panic on a few adversarial
+        // inputs the parser-fuzz harness would otherwise have to find.
+        // (`fuzz/` covers this exhaustively.)
+        for raw in [
+            "",
+            ",",
+            ",,,,",
+            "a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z",
+            "\0",
+            "\r\n",
+            &"x".repeat(8192),
+        ] {
+            let _ = parse_content_encoding(Some(raw));
+        }
+    }
+
+    #[test]
+    fn is_token_accepts_5_6_2_tchars_and_rejects_others() {
+        // Section 5.6.2 token = 1*tchar. Spot-check the boundary
+        // cases the parser's classification leans on.
+        for tok in ["identity", "gzip", "x-gzip", "abc.def_ghi"] {
+            assert!(is_token(tok), "'{tok}' should be a token");
+        }
+        for not_tok in ["", " ", "a b", "a,b", "a\"b", "a/b", "a:b", "a;b"] {
+            assert!(!is_token(not_tok), "'{not_tok}' should NOT be a token");
+        }
+    }
+
+    // -- §8.4 wire-level: a gzip'd HEAD / 206 / 200 is rejected --------------
+
+    const HEAD_10B_GZIP: &[u8] = b"HTTP/1.1 200 OK\r\n\
+        Content-Length: 10\r\n\
+        Accept-Ranges: bytes\r\n\
+        Content-Encoding: gzip\r\n\
+        Connection: close\r\n\
+        \r\n";
+
+    const HEAD_10B_IDENTITY: &[u8] = b"HTTP/1.1 200 OK\r\n\
+        Content-Length: 10\r\n\
+        Accept-Ranges: bytes\r\n\
+        Content-Encoding: identity\r\n\
+        Connection: close\r\n\
+        \r\n";
+
+    #[test]
+    fn local_server_head_with_gzip_content_encoding_is_rejected() {
+        // The 'GET' string is never reached — HEAD already rejects.
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 10\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD_10B_GZIP, GET);
+        let err = match HttpSource::open(&uri) {
+            Ok(_) => panic!("expected HEAD-time rejection on gzip Content-Encoding"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-identity Content-Encoding"),
+            "missing §8.4 phrasing: {msg}"
+        );
+        assert!(msg.contains("gzip"), "missing coding name 'gzip': {msg}");
+        assert!(msg.contains("§8.4"), "missing §8.4 cite: {msg}");
+    }
+
+    #[test]
+    fn local_server_head_with_identity_content_encoding_is_accepted() {
+        // §8.4: a server that lists `identity` is still naming
+        // "no coding applied"; the driver must accept it.
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 10\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD_10B_IDENTITY, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+    }
+
+    #[test]
+    fn local_server_206_with_gzip_content_encoding_is_rejected() {
+        // HEAD says identity (or nothing) — the 206 then sneaks in a
+        // gzip coding. We must reject before any compressed octet
+        // reaches the reader.
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 10\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Content-Encoding: gzip\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        let err = std::io::Read::read_exact(&mut src, &mut buf).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-identity Content-Encoding"),
+            "missing §8.4 phrasing on 206: {msg}"
+        );
+        assert!(msg.contains("gzip"), "missing 'gzip' in 206 error: {msg}");
+    }
+
+    #[test]
+    fn local_server_200_fallback_with_gzip_content_encoding_is_rejected() {
+        // §3.1 200 fallback path: server ignored Range and returned a
+        // full body — but compressed. Must reject before draining
+        // prefix bytes.
+        static GET: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 10\r\n\
+            Content-Encoding: deflate\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        let err = std::io::Read::read_exact(&mut src, &mut buf).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-identity Content-Encoding"),
+            "missing §8.4 phrasing on 200: {msg}"
+        );
+        assert!(msg.contains("deflate"), "missing 'deflate': {msg}");
+    }
+
+    #[test]
+    fn local_server_206_with_identity_content_encoding_is_accepted() {
+        // Sanity: a 206 that explicitly names identity is still
+        // accepted (§8.4: `identity` SHOULD NOT be listed but if it
+        // is, it means "no coding").
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 10\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Content-Encoding: identity\r\n\
             Connection: close\r\n\
             \r\n\
             0123456789";
