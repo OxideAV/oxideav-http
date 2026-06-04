@@ -413,8 +413,16 @@ impl HttpSource {
             let retry_after = head
                 .headers()
                 .get("retry-after")
-                .and_then(|v| v.to_str().ok());
-            let retry_msg = retry_after.map(format_retry_after_hint).unwrap_or_default();
+                .and_then(|v| v.to_str().ok())
+                .map(normalize_obs_fold);
+            // RFC 7230 §3.2.4: normalise obs-fold "prior to interpreting
+            // the field value". `format_retry_after_hint` is the
+            // interpretation step here, so the normalisation must
+            // happen before it sees the input.
+            let retry_msg = retry_after
+                .as_deref()
+                .map(format_retry_after_hint)
+                .unwrap_or_default();
             return Err(Error::other(format!(
                 "HTTP HEAD {uri}: status {status}{retry_msg}"
             )));
@@ -435,10 +443,16 @@ impl HttpSource {
         // absent" — the former is the server saying "do not attempt",
         // the latter is silence (§14.3 makes the header advisory, not
         // mandatory, even for range-capable servers).
-        let accept_ranges_raw = headers
+        // RFC 7230 §3.2.4: normalise obs-fold "prior to interpreting
+        // the field value". `Accept-Ranges` is a §5.6.1 list whose
+        // delimiter (`,`) makes it a plausible target for obs-folding
+        // by older origins or proxies, so the normalisation is wired
+        // here before the §14.3 list parser runs.
+        let accept_ranges_owned = headers
             .get("accept-ranges")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+            .map(normalize_obs_fold);
+        let accept_ranges_raw = accept_ranges_owned.as_deref().unwrap_or("");
         match parse_accept_ranges(accept_ranges_raw) {
             AcceptRanges::Bytes => {}
             AcceptRanges::None => {
@@ -981,6 +995,124 @@ fn is_token(s: &str) -> bool {
                         | b'~'
                 )
         })
+}
+
+/// Normalize obsolete line folding (`obs-fold`) in a header field value
+/// per RFC 7230 §3.2.4.
+///
+/// The §3.2 ABNF allows `field-value = *( field-content / obs-fold )`
+/// where `obs-fold = CRLF 1*( SP / HTAB )`. §3.2.4 makes the following
+/// hard requirement on a user agent that receives an obs-fold in a
+/// response (not within a `message/http` container):
+///
+/// > "A user agent that receives an obs-fold in a response message
+/// > that is not within a message/http container MUST replace each
+/// > received obs-fold with one or more SP octets prior to
+/// > interpreting the field value."
+///
+/// This helper performs exactly that normalisation. Each maximal run
+/// of `CRLF (SP/HTAB)+` inside `s` is collapsed to a single ASCII
+/// space (`0x20`). The "one or more SP" wording leaves the count to
+/// the recipient; one SP is the smallest stable choice — it preserves
+/// the token-boundary signal that the original whitespace carried (so
+/// e.g. an obs-folded comma-separated list still tokenises the same
+/// way) without padding the value with arbitrary whitespace that
+/// downstream parsers would just have to trim again.
+///
+/// The function is *only* a normaliser — it does not reject the input
+/// or report whether folding was found. §3.2.4 also permits a
+/// recipient to reject obs-folded requests with 400, but a user agent
+/// receiving a response has the MUST-normalise obligation, not a
+/// MUST-reject option, so the API surface here only models the
+/// normalisation outcome.
+///
+/// Returns a `Cow::Borrowed(s)` when no obs-fold occurrence is found
+/// (the common case) so cold-path callers stay allocation-free. A
+/// `Cow::Owned(_)` is returned when at least one fold was collapsed.
+///
+/// Bare CR or bare LF (not part of a CRLF pair) and CRLF NOT followed
+/// by SP/HTAB are left untouched — those are not obs-fold per the
+/// §3.2 ABNF; deciding what to do with them is the caller's job (the
+/// framing layer typically rejects them as line-terminators, which is
+/// out of scope for a field-value normaliser).
+///
+/// Examples (informal):
+///
+/// ```text
+/// "abc\r\n def"     -> "abc def"
+/// "abc\r\n\t def"   -> "abc def"   (multiple SP/HTAB collapsed to 1)
+/// "abc\r\n  \tdef"  -> "abc def"
+/// "a\r\n b\r\n\tc"  -> "a b c"     (two folds, two collapses)
+/// "abc def"         -> "abc def"   (no fold, no allocation)
+/// "abc\r\nxyz"      -> "abc\r\nxyz" (CRLF not followed by SP/HTAB:
+///                                    not obs-fold; left as-is)
+/// "abc\rdef"        -> "abc\rdef"  (bare CR: not obs-fold)
+/// ```
+fn normalize_obs_fold(s: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    // Fast scan on the &[u8] view to locate the first real obs-fold.
+    // SP / HTAB / CR / LF are all single-byte ASCII; obs-text (%x80-FF)
+    // is multi-byte in UTF-8 but never matches the CRLF + SP/HTAB
+    // pattern, so byte-level matching is safe.
+    let bytes = s.as_bytes();
+    let mut first_fold: Option<usize> = None;
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'\r'
+            && bytes[i + 1] == b'\n'
+            && (bytes[i + 2] == b' ' || bytes[i + 2] == b'\t')
+        {
+            first_fold = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    let start = match first_fold {
+        Some(p) => p,
+        None => return Cow::Borrowed(s),
+    };
+    // At least one fold confirmed. Build the owned form as bytes; the
+    // output is always UTF-8 because we only ever copy original bytes
+    // verbatim (preserving any obs-text multi-byte sequences in their
+    // entirety) or inject a single ASCII SP per collapsed fold.
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    out.extend_from_slice(&bytes[..start]);
+    let mut i = start;
+    while i < bytes.len() {
+        if i + 2 < bytes.len()
+            && bytes[i] == b'\r'
+            && bytes[i + 1] == b'\n'
+            && (bytes[i + 2] == b' ' || bytes[i + 2] == b'\t')
+        {
+            // §3.2.4: replace the obs-fold with "one or more SP
+            // octets". We emit exactly one SP — the smallest stable
+            // choice — and consume the maximal trailing SP/HTAB run.
+            out.push(b' ');
+            i += 2;
+            while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                i += 1;
+            }
+        } else {
+            // Not a fold start — copy this byte through verbatim.
+            // Multi-byte UTF-8 sequences are preserved because each
+            // continuation byte is also copied as-is by the next
+            // loop iteration; we never split a code point.
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    // SAFETY-equivalent: the output is byte-for-byte derived from a
+    // valid &str by (a) verbatim byte copies and (b) insertion of
+    // ASCII SP (0x20), neither of which can invalidate UTF-8. We
+    // still call the checked constructor to avoid `unsafe`.
+    match String::from_utf8(out) {
+        Ok(s2) => Cow::Owned(s2),
+        // Unreachable in practice (see above), but if a future edit
+        // ever breaks the byte-preserving invariant we'd rather fall
+        // back to the un-normalised input than silently corrupt the
+        // field value.
+        Err(_) => Cow::Borrowed(s),
+    }
 }
 
 /// Parse an `ETag` field value per RFC 9110 §8.8.3 grammar:
@@ -1590,6 +1722,13 @@ pub mod __fuzz {
     /// verify the function never panics on arbitrary input.
     pub fn format_retry_after_hint(s: &str) -> String {
         super::format_retry_after_hint(s)
+    }
+    /// Fuzz-only wrapper for [`super::normalize_obs_fold`] — exercises
+    /// the RFC 7230 §3.2.4 obs-fold normaliser on arbitrary input.
+    /// Returns the normalised string so the fuzzer can verify the
+    /// function never panics and always yields valid UTF-8.
+    pub fn normalize_obs_fold(s: &str) -> String {
+        super::normalize_obs_fold(s).into_owned()
     }
 }
 
@@ -3398,6 +3537,187 @@ mod tests {
             !msg.contains("Retry-After"),
             "must not emit a Retry-After hint when none was sent: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // RFC 7230 §3.2.4 obs-fold normalisation
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn obs_fold_absent_returns_borrowed_unchanged() {
+        // No `\r\n` at all — must short-circuit to Cow::Borrowed
+        // without allocating.
+        let s = "bytes=0-1023";
+        let out = normalize_obs_fold(s);
+        assert_eq!(out, "bytes=0-1023");
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn obs_fold_crlf_without_sp_or_htab_is_not_a_fold() {
+        // §3.2 ABNF: `obs-fold = CRLF 1*( SP / HTAB )`. A CRLF NOT
+        // followed by SP/HTAB is not an obs-fold; the function must
+        // leave it alone (the framing layer will flag it).
+        let s = "abc\r\nxyz";
+        let out = normalize_obs_fold(s);
+        assert_eq!(out, "abc\r\nxyz");
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn obs_fold_bare_cr_or_lf_is_not_a_fold() {
+        // Only the full `\r\n` sequence opens an obs-fold per §3.2.
+        // Bare CR followed by SP, or bare LF followed by SP, must
+        // pass through unmodified.
+        let s = "abc\r def";
+        let out = normalize_obs_fold(s);
+        assert_eq!(out, "abc\r def");
+        let s = "abc\n def";
+        let out = normalize_obs_fold(s);
+        assert_eq!(out, "abc\n def");
+    }
+
+    #[test]
+    fn obs_fold_single_sp_collapses_to_one_sp() {
+        // The minimal §3.2.4 case: `CRLF SP` between two field-vchar
+        // runs must become a single SP.
+        let s = "abc\r\n def";
+        let out = normalize_obs_fold(s);
+        assert_eq!(out, "abc def");
+        assert!(matches!(out, std::borrow::Cow::Owned(_)));
+    }
+
+    #[test]
+    fn obs_fold_single_htab_collapses_to_one_sp() {
+        // §3.2.4: HTAB is alternative-equivalent to SP inside the
+        // fold continuation. Both collapse to a single SP.
+        let s = "abc\r\n\tdef";
+        let out = normalize_obs_fold(s);
+        assert_eq!(out, "abc def");
+    }
+
+    #[test]
+    fn obs_fold_multiple_sp_htab_collapses_to_one_sp() {
+        // `obs-fold = CRLF 1*( SP / HTAB )` — the continuation is
+        // a maximal run of any mix of SP/HTAB. We collapse the whole
+        // run to one SP.
+        let s = "abc\r\n  \t \tdef";
+        let out = normalize_obs_fold(s);
+        assert_eq!(out, "abc def");
+    }
+
+    #[test]
+    fn obs_fold_multiple_folds_each_collapse_independently() {
+        // Two distinct obs-fold occurrences must each become exactly
+        // one SP — the count of folds in the input equals the count
+        // of replacement SPs in the output.
+        let s = "a\r\n b\r\n\tc";
+        let out = normalize_obs_fold(s);
+        assert_eq!(out, "a b c");
+    }
+
+    #[test]
+    fn obs_fold_at_start_of_value_collapses() {
+        // The §3.2 ABNF puts obs-fold inside `field-value`, so a
+        // value that begins with an obs-fold (the recipient passes
+        // through a non-stripped leading OWS context) must still
+        // collapse cleanly.
+        let s = "\r\n abc";
+        let out = normalize_obs_fold(s);
+        assert_eq!(out, " abc");
+    }
+
+    #[test]
+    fn obs_fold_trailing_crlf_without_continuation_is_not_a_fold() {
+        // A trailing `\r\n` with no SP/HTAB after it is the framing
+        // line-terminator, not an obs-fold. Pass through unmodified.
+        let s = "abc\r\n";
+        let out = normalize_obs_fold(s);
+        assert_eq!(out, "abc\r\n");
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn obs_fold_preserves_obs_text_bytes() {
+        // §3.2 allows `obs-text = %x80-FF` inside field-vchar. Such
+        // bytes appear as multi-byte UTF-8 sequences in &str. The
+        // normaliser must not split or mangle them.
+        // U+00E9 ('é') is two UTF-8 bytes: 0xC3 0xA9.
+        let s = "ab\u{00e9}\r\n cd\u{00e9}";
+        let out = normalize_obs_fold(s);
+        assert_eq!(out, "ab\u{00e9} cd\u{00e9}");
+    }
+
+    #[test]
+    fn obs_fold_does_not_touch_intra_field_whitespace_runs() {
+        // The §3.2 ABNF allows `1*( SP / HTAB )` inside
+        // field-content; only CRLF-prefixed runs are obs-fold. A
+        // plain `   ` in the middle of a value is data and must be
+        // left exactly as is.
+        let s = "abc   def\t\tghi";
+        let out = normalize_obs_fold(s);
+        assert_eq!(out, "abc   def\t\tghi");
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn obs_fold_empty_input_is_borrowed_empty() {
+        // Defensive: an empty field-value (§3.2 `*( field-content /
+        // obs-fold )` permits zero occurrences) must short-circuit.
+        let s = "";
+        let out = normalize_obs_fold(s);
+        assert_eq!(out, "");
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn obs_fold_then_non_fold_crlf_handles_each_independently() {
+        // Mixed input: one real fold, then a CRLF that is NOT a
+        // fold. The fold collapses; the trailing CRLF survives.
+        let s = "a\r\n b\r\nc";
+        let out = normalize_obs_fold(s);
+        assert_eq!(out, "a b\r\nc");
+    }
+
+    #[test]
+    fn obs_fold_inside_quoted_string_is_still_normalised() {
+        // §3.2.4 has no exception for quoted-string spans; the
+        // normalisation runs at the field-value layer, before any
+        // grammar-specific parser. A folded value inside a
+        // quoted-string still loses the `CRLF SP` framing — the
+        // quoted-string parser sees a single SP and treats it as a
+        // literal space, which matches what the sender intended
+        // before the §3.2.4-deprecated line-folding pass.
+        let s = "\"a\r\n b\"";
+        let out = normalize_obs_fold(s);
+        assert_eq!(out, "\"a b\"");
+    }
+
+    #[test]
+    fn obs_fold_chained_folds_back_to_back_collapse_once_each() {
+        // Two folds with no field-vchar between them is unusual but
+        // not ill-formed: `CRLF SP CRLF SP`. Per §3.2.4 each fold
+        // collapses to one SP, so the output is two SPs.
+        let s = "a\r\n \r\n b";
+        let out = normalize_obs_fold(s);
+        assert_eq!(out, "a  b");
+    }
+
+    #[test]
+    fn obs_fold_existing_parsers_remain_obs_fold_agnostic() {
+        // Sanity coupling: the function's contract is "normalise
+        // before interpreting the field value", so feeding a folded
+        // input directly to one of the §5.6.7 / §10.2.3 parsers
+        // would still fail (they don't know about folds). After
+        // normalisation, the same parser succeeds. This pins the
+        // §3.2.4 "prior to interpreting" ordering.
+        let folded = "Wed, 21 Oct 2026\r\n 07:28:00 GMT";
+        // Pre-normalisation: the parser sees CRLF SP and rejects.
+        assert!(parse_imf_fixdate(folded).is_none());
+        // Post-normalisation: a single SP collapses cleanly into
+        // the expected single-space separator.
+        let normalised = normalize_obs_fold(folded);
+        assert!(parse_imf_fixdate(&normalised).is_some());
     }
 
     #[test]

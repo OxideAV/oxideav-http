@@ -250,6 +250,35 @@ The §10.2.3 grammar is intentionally strict:
   (IMF-fixdate / rfc850-date / asctime-date) — random tokens
   like `"never"` or `"Tomorrow at noon"` produce `None`.
 
+## Obs-fold normalisation (RFC 7230 §3.2.4)
+
+Field values picked off of the response are normalised through a
+small §3.2.4 helper before they reach a grammar-specific parser.
+The §3.2 ABNF allows `field-value = *( field-content / obs-fold )`
+with `obs-fold = CRLF 1*( SP / HTAB )`, and §3.2.4 makes the
+following hard requirement on a user agent that receives an
+obs-folded response (not inside a `message/http` container):
+
+> A user agent that receives an obs-fold in a response message that
+> is not within a message/http container MUST replace each received
+> obs-fold with one or more SP octets prior to interpreting the
+> field value.
+
+The driver collapses each maximal `CRLF (SP/HTAB)+` run to a single
+ASCII space — the smallest stable choice that preserves the
+token-boundary signal the original whitespace carried (so an
+obs-folded comma-separated list still tokenises the same way) —
+before invoking the §14.3 `Accept-Ranges` list parser or the
+§10.2.3 `Retry-After` hint formatter on the HEAD non-success path.
+Bare CR, bare LF, and CRLF NOT followed by SP/HTAB are left
+untouched: they are not obs-fold per the §3.2 ABNF and the framing
+layer below is the right place to flag them. Empty inputs and
+inputs that carry no fold short-circuit through a `Cow::Borrowed`
+return so the production path stays allocation-free (modern HTTP
+clients strip folds at the framing layer, so the helper is a
+defence-in-depth guard that almost never has to act, but the
+invariant is now explicit in the code).
+
 ## Fuzzing
 
 `fuzz/` carries a cargo-fuzz harness (`parse_headers`) that drives
@@ -262,6 +291,7 @@ plus the unified §5.6.7 dispatcher `parse_http_date`,
 `parse_accept_ranges` (§14.3),
 `is_multipart_byteranges_content_type` (§8.3 / §14.6 / §15.3.7.2),
 `format_retry_after_hint` (§10.2.3 HEAD surfacing helper),
+`normalize_obs_fold` (RFC 7230 §3.2.4 obs-fold normaliser),
 and the composite
 `derive_strong_validator` (§13.1.5 + §8.8.2.2 + §8.8.3).
 The harness

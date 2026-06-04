@@ -40,6 +40,8 @@
 //!   media-type / §14.6 / §15.3.7.2 single-range MUST-NOT detector.
 //! * `format_retry_after_hint` — RFC 9110 §10.2.3 surfacing helper
 //!   exercised on the HEAD non-success branch.
+//! * `normalize_obs_fold` — RFC 7230 §3.2.4 obs-fold normalisation
+//!   helper. Contract: never panics, output is always valid UTF-8.
 //! * `derive_strong_validator` — §13.1.5 + §8.8.2.2 + §8.8.3
 //!   composite that picks an If-Range value from a HEAD's three
 //!   relevant headers.
@@ -61,6 +63,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = __fuzz::parse_accept_ranges(s);
         let _ = __fuzz::is_multipart_byteranges_content_type(s);
         let _ = __fuzz::format_retry_after_hint(s);
+        let _ = __fuzz::normalize_obs_fold(s);
     }
 
     // Pass 2: NUL-split the input into up to three fields for the

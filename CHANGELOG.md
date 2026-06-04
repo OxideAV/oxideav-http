@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- RFC 7230 §3.2.4 obs-fold normalisation. New internal helper
+  `normalize_obs_fold(&str) -> Cow<str>` collapses each `obs-fold =
+  CRLF 1*( SP / HTAB )` occurrence to a single ASCII space, fulfilling
+  the §3.2.4 "A user agent that receives an obs-fold in a response
+  message that is not within a message/http container MUST replace
+  each received obs-fold with one or more SP octets prior to
+  interpreting the field value" MUST. The driver wires the helper at
+  two header-consumption sites: the §14.3 `Accept-Ranges` list parser
+  in `open_impl` and the §10.2.3 `Retry-After` hint formatter on the
+  HEAD non-success branch. Production-path overhead is zero (the
+  helper short-circuits to `Cow::Borrowed` when no fold is present,
+  which is the case for every field value modern HTTP clients hand
+  through; the explicit normalisation is a defence-in-depth guard
+  against framing layers that pass `message/http`-style raw frames or
+  obs-folded values through unmodified). 16 new unit tests cover:
+  borrowed-on-absent, CRLF-without-SP-or-HTAB (not a fold), bare CR
+  and bare LF (not a fold), single SP fold, single HTAB fold, mixed
+  SP/HTAB run, multiple distinct folds, fold at start of value,
+  trailing CRLF without continuation, obs-text byte preservation (U+00E9
+  multi-byte UTF-8 across a fold boundary), intra-field whitespace
+  untouched, empty input, mixed fold-then-non-fold-CRLF, fold inside
+  a quoted-string span, chained back-to-back folds, and a coupling
+  test pinning the §3.2.4 "prior to interpreting" ordering against
+  `parse_imf_fixdate`. The helper is also re-exported through the
+  `#[doc(hidden)] pub mod __fuzz` gate so the cargo-fuzz
+  `parse_headers` harness exercises it on arbitrary input alongside
+  every other §5.6.7 / §10.2.3 / §14.3 / §14.4 / §8.8.3 parser.
 - RFC 9110 §15.3.7.2 + §14.6 + §8.3 `multipart/byteranges` rejection on
   a 206 response. The driver only ever sends `Range: bytes=N-`
   (single-range), and §15.3.7.2 makes "A server MUST NOT generate a
