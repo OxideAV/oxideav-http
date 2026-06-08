@@ -45,6 +45,10 @@
 //! * `unquote_string` — RFC 9110 §5.6.4 `quoted-string` unwrap with
 //!   `quoted-pair` collapse. Contract: never panics, every output
 //!   string (when `Some`) is valid UTF-8.
+//! * `parse_parameters` — RFC 9110 §5.6.6 `parameters` grammar
+//!   (semicolon-delimited `name=value` list with quoted-string-aware
+//!   splitting). Contract: never panics, every returned `(name, value)`
+//!   pair is valid UTF-8.
 //! * `derive_strong_validator` — §13.1.5 + §8.8.2.2 + §8.8.3
 //!   composite that picks an If-Range value from a HEAD's three
 //!   relevant headers.
@@ -68,6 +72,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = __fuzz::format_retry_after_hint(s);
         let _ = __fuzz::normalize_obs_fold(s);
         let _ = __fuzz::unquote_string(s);
+        let _ = __fuzz::parse_parameters(s);
     }
 
     // Pass 2: NUL-split the input into up to three fields for the

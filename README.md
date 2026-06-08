@@ -277,6 +277,44 @@ the happy path with no escapes present the return is a borrow of
 the input slice (zero allocations); only the slow path of an actual
 escape allocates.
 
+## Parameters list (RFC 9110 §5.6.6)
+
+`parse_parameters` consumes a `parameters` tail —
+`*( OWS ";" OWS [ parameter ] )` with
+`parameter = parameter-name "=" parameter-value` and
+`parameter-value = ( token / quoted-string )` — and returns an
+ordered `Vec<(name, value)>` of `(lowercase-name, decoded-value)`
+pairs.
+
+The splitter is quoted-string-aware: a `;` inside a `"…"` body is
+part of the value, not a slot terminator, and a `\"` inside the
+body is a §5.6.4 `quoted-pair` (skipped by the splitter so it does
+not prematurely close the value). Each quoted-string value is
+routed through `unquote_string` so the consumer receives the
+logical octet sequence; each token-shape value is preserved
+verbatim (case-sensitivity of the value is parameter-name-specific
+per §5.6.6, so we don't fold the case).
+
+Defensive posture for malformed slots matches `parse_accept_ranges`:
+empty slots, missing-`=` slots, whitespace-around-`=` slots (per
+§5.6.6's "Parameters do not allow whitespace (not even 'bad'
+whitespace) around the '=' character" note), non-token names,
+non-token unquoted values, and unterminated quoted-strings are all
+silently skipped — the surrounding legitimate parameters survive.
+
+The primitive sits ready to back any future per-parameter
+inspection — e.g. a §8.3.1 `charset="utf-8"` extractor on
+`Content-Type`, a §14.6 `boundary=` lookup on
+`multipart/byteranges` if we ever decide to parse rather than
+reject it (§15.3.7.2), or §11.4 `realm="…"` auth-param decoding
+after the caller has split the challenge on its `,` boundaries
+(§11.2 auth-params themselves are `,`-separated, but each
+individual auth-param value follows the §5.6.6 shape and can be
+processed by this helper one slot at a time).
+
+The helper is exercised by 23 unit tests and the cargo-fuzz
+`parse_headers` harness through the `__fuzz` re-export gate.
+
 ## Obs-fold normalisation (RFC 7230 §3.2.4)
 
 Field values picked off of the response are normalised through a
@@ -320,6 +358,8 @@ plus the unified §5.6.7 dispatcher `parse_http_date`,
 `format_retry_after_hint` (§10.2.3 HEAD surfacing helper),
 `normalize_obs_fold` (RFC 7230 §3.2.4 obs-fold normaliser),
 `unquote_string` (RFC 9110 §5.6.4 quoted-string unwrap),
+`parse_parameters` (RFC 9110 §5.6.6 semicolon-delimited
+`name=value` list with quoted-string-aware splitting),
 and the composite
 `derive_strong_validator` (§13.1.5 + §8.8.2.2 + §8.8.3).
 The harness

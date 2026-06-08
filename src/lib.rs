@@ -1230,6 +1230,194 @@ fn unquote_string(s: &str) -> Option<std::borrow::Cow<'_, str>> {
     }
 }
 
+/// Parse a `parameters` production per RFC 9110 §5.6.6 into an ordered
+/// `Vec<(name, value)>` of `(lowercase-name, decoded-value)` pairs.
+///
+/// ```text
+/// parameters      = *( OWS ";" OWS [ parameter ] )
+/// parameter       = parameter-name "=" parameter-value
+/// parameter-name  = token
+/// parameter-value = ( token / quoted-string )
+/// ```
+///
+/// Used by callers that have already split a field value's "main" item
+/// off of the parameters tail — e.g. the §8.3.1 media type
+/// (`type/subtype`) is followed by `*( OWS ";" OWS parameter )`, the
+/// §12.5.1 `Accept` field's q-factor lives in the same construction, and
+/// the §11.4 `WWW-Authenticate` challenges carry `realm="…", scope=token`
+/// auth-params using equivalent shape. The caller passes the tail
+/// starting from the first `;` (or starting from an empty/whitespace-only
+/// slice if no parameters were attached), and we return one entry per
+/// `parameter` that parses; empty list elements (e.g. `;; charset=utf-8`)
+/// are silently ignored, matching the §5.6.1 recipient note that empty
+/// elements do not contribute. The function never panics on arbitrary
+/// input.
+///
+/// Behaviour:
+///
+/// - **Names**: lowercased on the way out (§5.6.6: "Parameter names are
+///   case-insensitive"). A `parameter-name` that is not a valid §5.6.2
+///   token causes that whole entry to be skipped, not a hard reject of
+///   the surrounding list — same defensive choice as the
+///   `parse_accept_ranges` recipient logic.
+/// - **Values**: when the value is `( token )` we return it verbatim
+///   (case preservation is the caller's job per §5.6.6's "Parameter
+///   values might or might not be case-sensitive, depending on the
+///   semantics of the parameter name"); when the value is
+///   `( quoted-string )` we run it through [`unquote_string`] so any
+///   `quoted-pair` is collapsed per §5.6.4's MUST and the consumer
+///   receives the logical octet sequence (boundaries, charsets, realms)
+///   ready to pattern-match.
+/// - **No whitespace around `=`**: §5.6.6's informational note says
+///   "Parameters do not allow whitespace (not even 'bad' whitespace)
+///   around the '=' character." A parameter that has SP / HTAB before
+///   or after `=` is skipped (not a list-fatal reject), matching the
+///   "ignore the bad slot" defensive posture.
+/// - **Missing `=`**: a slot like `; foo` (token with no `=value` tail)
+///   is skipped — §5.6.6's `parameter = parameter-name "=" parameter-value`
+///   makes the `=` a required production; some §8.3.1 in-the-wild
+///   senders strip the value, but recipients here decline to invent one.
+/// - **Quoted-string boundary**: the `;` split honours quoted-strings —
+///   a `;` inside a `"…"` body (e.g. `boundary="a;b"`) is not a slot
+///   terminator. Backslash escapes inside the quoted-string are
+///   respected by the splitter (so `"a\";b"` reads the `\"` as a
+///   quoted-pair and continues past it).
+/// - **Optional leading `;`**: callers that hand the tail starting from
+///   the first byte after the main item (which is usually `;` but can be
+///   `OWS ;`) get the same result as callers that hand the tail starting
+///   from the OWS-stripped post-`;` position; the function consumes
+///   leading whitespace and an optional `;` before the first parameter.
+///
+/// Returns an empty `Vec` for empty / whitespace-only / `;`-only inputs.
+/// Allocates one `String` per kept name and one per quoted-string body
+/// containing at least one `quoted-pair`; token-shape values reuse the
+/// input via `String::from(&str)`.
+#[allow(dead_code)]
+fn parse_parameters(s: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    // Outer loop: each iteration consumes one slot (between two `;`
+    // boundaries) and either pushes a (name, value) pair or skips it.
+    loop {
+        // 1. Strip OWS (SP / HTAB only — §5.6.3 OWS).
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        // 2. A leading `;` (or any subsequent slot boundary) is consumed
+        //    once here; if the slot started directly at a parameter,
+        //    skip this step.
+        if i < bytes.len() && bytes[i] == b';' {
+            i += 1;
+            continue;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        // 3. Find the end of this slot. The slot ends at the next
+        //    top-level `;` (i.e. a `;` not inside a quoted-string).
+        let slot_start = i;
+        let mut in_quote = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_quote {
+                if b == b'\\' {
+                    // Skip the next octet (the quoted-pair RHS) so that
+                    // `\"` inside the body does not close the quote.
+                    if i + 1 < bytes.len() {
+                        i += 2;
+                        continue;
+                    }
+                    // Trailing lone backslash inside a quoted-string —
+                    // the slot is malformed; let the per-slot parser
+                    // see the body and reject it.
+                    i += 1;
+                } else if b == b'"' {
+                    in_quote = false;
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            } else if b == b';' {
+                break;
+            } else if b == b'"' {
+                in_quote = true;
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        let slot = &s[slot_start..i];
+        // 4. Try to parse the slot as a single parameter. Anything
+        //    that doesn't fit `name=value` (token + `=` + token/qstr)
+        //    is skipped per the §5.6.1 "tolerate empty / garbage
+        //    list slots" recipient posture.
+        if let Some(pair) = parse_one_parameter(slot) {
+            out.push(pair);
+        }
+        // 5. Slot terminator: consume the `;` (if any) and loop.
+        if i < bytes.len() && bytes[i] == b';' {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Single-parameter parser: `parameter-name "=" parameter-value`. Returns
+/// `Some((lowercase-name, decoded-value))` on a syntactically valid
+/// `parameter`, `None` for empty / whitespace-only / no-`=` / bad-token
+/// / whitespace-around-`=` / malformed-quoted-string slots.
+fn parse_one_parameter(slot: &str) -> Option<(String, String)> {
+    // §5.6.3 OWS strip on the slot edges. The split-into-slots step
+    // above already stripped OWS at the start of the slot, but an OWS
+    // *trail* (between the last value byte and the next `;`) is normal
+    // in a §5.6.6 list and must be removed here. We trim both ends in
+    // case the slot came from a no-`;`-yet single-call.
+    let slot = slot.trim_matches(|c: char| c == ' ' || c == '\t');
+    if slot.is_empty() {
+        return None;
+    }
+    let eq = slot.find('=')?;
+    let name = &slot[..eq];
+    let value = &slot[eq + 1..];
+    // §5.6.6 note: "Parameters do not allow whitespace (not even 'bad'
+    // whitespace) around the '=' character." If the byte just before
+    // `=` or the byte just after `=` is SP / HTAB, reject the slot.
+    if name
+        .as_bytes()
+        .last()
+        .map(|&b| b == b' ' || b == b'\t')
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    if value
+        .as_bytes()
+        .first()
+        .map(|&b| b == b' ' || b == b'\t')
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    // §5.6.6: `parameter-name = token` — reject any non-token name so
+    // that downstream consumers can rely on it. (We do not gate on
+    // emptiness specifically; `is_token` rejects empty inputs.)
+    if !is_token(name) {
+        return None;
+    }
+    // §5.6.6: `parameter-value = ( token / quoted-string )`. If the
+    // value starts with DQUOTE, route it through the §5.6.4 unwrap
+    // (which collapses any quoted-pair). Otherwise it MUST be a token.
+    let decoded_value = if value.starts_with('"') {
+        unquote_string(value)?.into_owned()
+    } else if is_token(value) {
+        value.to_owned()
+    } else {
+        return None;
+    };
+    Some((name.to_ascii_lowercase(), decoded_value))
+}
+
 /// Parse an `ETag` field value per RFC 9110 §8.8.3 grammar:
 ///
 /// ```text
@@ -1852,6 +2040,16 @@ pub mod __fuzz {
     /// outcome must be reachable without a panic.
     pub fn unquote_string(s: &str) -> Option<String> {
         super::unquote_string(s).map(|c| c.into_owned())
+    }
+    /// Fuzz-only wrapper for [`super::parse_parameters`] — exercises the
+    /// RFC 9110 §5.6.6 `parameters` grammar (semicolon-delimited
+    /// `name=value` slots with quoted-string-aware splitting) on
+    /// arbitrary input. Returns the count of recognised parameters so
+    /// the fuzzer can drive both the zero-parameter and many-parameter
+    /// branches; the function must never panic, and every returned
+    /// `(name, value)` pair must be valid UTF-8.
+    pub fn parse_parameters(s: &str) -> usize {
+        super::parse_parameters(s).len()
     }
 }
 
@@ -4009,6 +4207,291 @@ mod tests {
         // verbatim regardless of which bytes those are.
         let v = unquote_string("\"--my\\\"boundary--\"").unwrap();
         assert_eq!(&*v, "--my\"boundary--");
+    }
+
+    // --- §5.6.6 parameters ---------------------------------------------
+
+    #[test]
+    fn parse_parameters_empty_input_yields_no_entries() {
+        // §5.6.6 `parameters = *( OWS ";" OWS [ parameter ] )` — zero
+        // repetitions is the canonical empty case (a media type with
+        // no attached parameters).
+        assert!(parse_parameters("").is_empty());
+    }
+
+    #[test]
+    fn parse_parameters_whitespace_only_yields_no_entries() {
+        // §5.6.3 OWS in any quantity must not produce phantom entries.
+        assert!(parse_parameters("   \t  ").is_empty());
+    }
+
+    #[test]
+    fn parse_parameters_semicolon_only_yields_no_entries() {
+        // §5.6.1 recipient requirement: "A recipient MUST parse and
+        // ignore … empty list elements." A trail of bare semicolons is
+        // the in-the-wild equivalent on the §5.6.6 parameter list.
+        assert!(parse_parameters(";").is_empty());
+        assert!(parse_parameters(";;;").is_empty());
+        assert!(parse_parameters("; ; ;").is_empty());
+    }
+
+    #[test]
+    fn parse_parameters_single_token_value() {
+        // Canonical `; name=token` from §5.6.6 example domain (e.g.
+        // `Content-Type: text/plain; charset=utf-8` after the main
+        // type/subtype has been split off).
+        let p = parse_parameters("; charset=utf-8");
+        assert_eq!(p, vec![("charset".to_owned(), "utf-8".to_owned())]);
+    }
+
+    #[test]
+    fn parse_parameters_leading_semicolon_optional() {
+        // Whether the caller strips the leading `;` or hands it through,
+        // the parser must produce the same output. Both shapes are
+        // legal §5.6.6 tails.
+        let with_semi = parse_parameters("; charset=utf-8");
+        let without_semi = parse_parameters("charset=utf-8");
+        assert_eq!(with_semi, without_semi);
+    }
+
+    #[test]
+    fn parse_parameters_name_lowercased_per_5_6_6_case_insensitivity() {
+        // §5.6.6: "Parameter names are case-insensitive." We emit
+        // lowercase so downstream pattern-matches use a stable form.
+        let p = parse_parameters("; CHARSET=UTF-8");
+        // Name lowercased; value preserved verbatim (case-sensitivity
+        // of the value depends on the semantics of the name — §5.6.6).
+        assert_eq!(p, vec![("charset".to_owned(), "UTF-8".to_owned())]);
+    }
+
+    #[test]
+    fn parse_parameters_quoted_string_value_unwrapped() {
+        // `parameter-value = ( token / quoted-string )`. When the value
+        // is a quoted-string the parser MUST unwrap it through §5.6.4
+        // so a consumer sees the logical octet sequence.
+        let p = parse_parameters("; boundary=\"--foo\"");
+        assert_eq!(p, vec![("boundary".to_owned(), "--foo".to_owned())]);
+    }
+
+    #[test]
+    fn parse_parameters_quoted_pair_collapsed_per_5_6_4() {
+        // A `\"` inside the body is a §5.6.4 quoted-pair and MUST
+        // collapse to a single `"` in the decoded value. This is the
+        // exact case the unquote helper exists for.
+        let p = parse_parameters("; boundary=\"--my\\\"boundary--\"");
+        assert_eq!(
+            p,
+            vec![("boundary".to_owned(), "--my\"boundary--".to_owned())],
+        );
+    }
+
+    #[test]
+    fn parse_parameters_semicolon_inside_quoted_string_not_a_separator() {
+        // The split-into-slots step MUST honour quoted-strings: a `;`
+        // inside a `"…"` body is part of the value, not a list
+        // terminator. Otherwise `boundary="a;b"` would be sliced into
+        // `boundary="a` + `b"`, each of which would then fail to parse
+        // and the legitimate value would silently disappear.
+        let p = parse_parameters("; boundary=\"a;b\"");
+        assert_eq!(p, vec![("boundary".to_owned(), "a;b".to_owned())]);
+    }
+
+    #[test]
+    fn parse_parameters_escaped_dquote_inside_quoted_string_not_a_close() {
+        // A `\"` inside the body is a quoted-pair, NOT the closing
+        // DQUOTE of the value. The splitter MUST respect that or the
+        // remaining `;` would slice the value in two.
+        let p = parse_parameters("; name=\"a\\\";b\"");
+        assert_eq!(p, vec![("name".to_owned(), "a\";b".to_owned())]);
+    }
+
+    #[test]
+    fn parse_parameters_multiple_entries_preserved_in_order() {
+        // §5.6.6 doesn't mandate an ordering for downstream consumers,
+        // but our return Vec preserves input order so a caller that
+        // wants "first wins" or "last wins" can implement either policy.
+        let p = parse_parameters("; charset=utf-8; format=flowed; delsp=yes");
+        assert_eq!(
+            p,
+            vec![
+                ("charset".to_owned(), "utf-8".to_owned()),
+                ("format".to_owned(), "flowed".to_owned()),
+                ("delsp".to_owned(), "yes".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn parse_parameters_empty_slot_silently_skipped() {
+        // §5.6.1: "A recipient MUST parse and ignore a reasonable
+        // number of empty list elements." Same applies to the §5.6.6
+        // parameter list — an empty `; ; ` slot in the middle does
+        // not nuke the surrounding good entries.
+        let p = parse_parameters("; charset=utf-8; ; format=flowed");
+        assert_eq!(
+            p,
+            vec![
+                ("charset".to_owned(), "utf-8".to_owned()),
+                ("format".to_owned(), "flowed".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn parse_parameters_missing_equals_skipped() {
+        // §5.6.6: `parameter = parameter-name "=" parameter-value`. The
+        // `=` is a required production; a bare token slot is malformed
+        // and we skip it rather than fabricate a value.
+        let p = parse_parameters("; charset=utf-8; bogus; format=flowed");
+        assert_eq!(
+            p,
+            vec![
+                ("charset".to_owned(), "utf-8".to_owned()),
+                ("format".to_owned(), "flowed".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn parse_parameters_whitespace_around_equals_skipped() {
+        // §5.6.6 informational note: "Parameters do not allow
+        // whitespace (not even 'bad' whitespace) around the '='
+        // character." Any SP / HTAB before or after `=` makes the
+        // parameter ill-formed and we skip it. The legitimate
+        // neighbours on either side remain.
+        let p = parse_parameters("; a=1; b = 2; c=3");
+        assert_eq!(
+            p,
+            vec![
+                ("a".to_owned(), "1".to_owned()),
+                ("c".to_owned(), "3".to_owned()),
+            ],
+        );
+        // Also covers the "only-before" and "only-after" sub-cases.
+        let only_before = parse_parameters("; b =2");
+        assert!(only_before.is_empty());
+        let only_after = parse_parameters("; b= 2");
+        assert!(only_after.is_empty());
+    }
+
+    #[test]
+    fn parse_parameters_non_token_name_skipped() {
+        // §5.6.6: `parameter-name = token`. A name byte outside the
+        // §5.6.2 tchar set (e.g. SP inside what should be one token)
+        // is ill-formed. The whole slot is skipped, the rest of the
+        // list survives.
+        let p = parse_parameters("; bad name=v; ok=v");
+        assert_eq!(p, vec![("ok".to_owned(), "v".to_owned())]);
+    }
+
+    #[test]
+    fn parse_parameters_non_token_unquoted_value_skipped() {
+        // §5.6.6: `parameter-value = ( token / quoted-string )`. An
+        // unquoted value that includes a non-token byte (e.g. SP) is
+        // neither shape and must be skipped — a sender that wanted
+        // SP in the value should have quoted-string'd it.
+        let p = parse_parameters("; bad=a b; ok=v");
+        assert_eq!(p, vec![("ok".to_owned(), "v".to_owned())]);
+    }
+
+    #[test]
+    fn parse_parameters_malformed_quoted_string_value_skipped() {
+        // An unterminated `"…` is not a valid §5.6.4 quoted-string,
+        // so the §5.6.6 slot it occupies is not a valid `parameter`
+        // and must be skipped — the value never silently truncates.
+        let p = parse_parameters("; bad=\"unterminated; ok=v");
+        // The splitter walks past the `;` inside the (open) quoted
+        // span looking for the close DQUOTE, runs off the end, and
+        // hands the whole tail to the per-slot parser which rejects
+        // it. Net effect: zero entries.
+        assert!(p.is_empty(), "got: {p:?}");
+    }
+
+    #[test]
+    fn parse_parameters_ows_around_semicolons_tolerated() {
+        // §5.6.3 OWS is permitted on both sides of each `;` (the
+        // `*( OWS ";" OWS [ parameter ] )` production). Tabs and
+        // spaces in any quantity must not affect the parsed entries.
+        let p = parse_parameters(" \t ;  \t a=1 \t ;\tb=2\t");
+        assert_eq!(
+            p,
+            vec![
+                ("a".to_owned(), "1".to_owned()),
+                ("b".to_owned(), "2".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn parse_parameters_quoted_value_with_obs_text_byte_preserved() {
+        // §5.6.4 qdtext includes obs-text = %x80-FF. A multi-byte
+        // UTF-8 sequence inside a quoted-string body must survive
+        // unwrap intact — the helper's checked UTF-8 reconstruction
+        // covers this end of the contract.
+        let p = parse_parameters("; title=\"caf\u{00e9}\"");
+        assert_eq!(p, vec![("title".to_owned(), "caf\u{00e9}".to_owned())]);
+    }
+
+    #[test]
+    fn parse_parameters_realm_auth_param_shape_handles_quoted_value() {
+        // §11.4 `WWW-Authenticate` challenges carry `realm="…"` plus
+        // other auth-params. Auth-params themselves are `,`-separated
+        // (§11.2), not `;`-separated — so this §5.6.6 parser is the
+        // wrong tool for a full challenge, but a caller that has
+        // already split on `,` and is processing a single
+        // `realm="…"` slot must get the value unwrapped cleanly.
+        let p = parse_parameters("; realm=\"Protected Area\"");
+        assert_eq!(p, vec![("realm".to_owned(), "Protected Area".to_owned())]);
+    }
+
+    #[test]
+    fn parse_parameters_comma_inside_value_is_not_a_separator() {
+        // §5.6.6 makes `;` the slot terminator; `,` is not. A `,` in
+        // an unquoted token-shape value would simply not be a valid
+        // token byte (§5.6.2 tchar excludes `,`) and the whole slot
+        // would be skipped. Confirm the splitter doesn't accidentally
+        // treat `,` as a slot end (which would silently truncate the
+        // value at the `,`).
+        let p = parse_parameters("; bad=a,b");
+        // The value `a,b` is not a §5.6.2 token (`,` is not tchar),
+        // so the slot is rejected as a whole — net result: zero
+        // entries. We are NOT silently keeping the prefix `a` and
+        // dropping `,b`; either we accept the whole thing or we
+        // skip the whole slot.
+        assert!(p.is_empty(), "got: {p:?}");
+    }
+
+    #[test]
+    fn parse_parameters_token_value_with_dot_underscore_dash_accepted() {
+        // §5.6.2 tchar includes `.` `_` `-` — values like `text/plain`
+        // identifiers, MIME subtype tails, and protocol versions
+        // (`http/1.1` would tokenise as `http/1.1` if `/` were a tchar,
+        // which it isn't; but `1.1`, `my_thing`, `app-name` all do).
+        let p = parse_parameters("; v=1.1; tag=my_thing; ua=app-name");
+        assert_eq!(
+            p,
+            vec![
+                ("v".to_owned(), "1.1".to_owned()),
+                ("tag".to_owned(), "my_thing".to_owned()),
+                ("ua".to_owned(), "app-name".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn parse_parameters_coupling_with_unquote_string_layering() {
+        // Coupling test: pin the §5.6.6 → §5.6.4 layering. A value
+        // that round-trips through `unquote_string` directly MUST
+        // match the same value pulled out of `parse_parameters`. This
+        // catches a future change that fork-decodes the quoted-string
+        // inside `parse_parameters` rather than delegating.
+        let direct = unquote_string("\"--my\\\"boundary--\"").unwrap();
+        let via_params = parse_parameters("; boundary=\"--my\\\"boundary--\"")
+            .into_iter()
+            .next()
+            .unwrap()
+            .1;
+        assert_eq!(&*direct, via_params);
     }
 
     #[test]

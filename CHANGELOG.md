@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- RFC 9110 §5.6.6 `parameters` list parser. New internal helper
+  `parse_parameters(&str) -> Vec<(String, String)>` consumes a
+  `parameters = *( OWS ";" OWS [ parameter ] )` tail and emits an
+  ordered list of `(lowercase-name, decoded-value)` pairs. The
+  splitter is quoted-string-aware — a `;` inside a `"…"` body is
+  part of the value (not a slot terminator), and a `\"` inside the
+  body is a §5.6.4 `quoted-pair` (skipped by the splitter so the
+  value isn't truncated at it). Token-shape values are preserved
+  verbatim (case-sensitivity is parameter-name-specific per
+  §5.6.6); quoted-string values are routed through `unquote_string`
+  so a consumer receives the logical octet sequence with every
+  `quoted-pair` collapsed per §5.6.4's MUST. Defensive posture
+  matches `parse_accept_ranges`: empty slots, missing-`=` slots,
+  slots with SP / HTAB around `=` (§5.6.6's informational "not
+  even 'bad' whitespace" note), non-token names, non-token
+  unquoted values, and unterminated quoted-string values are all
+  silently skipped while the surrounding legitimate parameters
+  survive. The primitive sits ready to back any future
+  per-parameter inspection — e.g. a §8.3.1 `charset="utf-8"`
+  extractor on `Content-Type`, a §14.6 `boundary=` lookup on
+  `multipart/byteranges` (currently rejected wholesale per
+  §15.3.7.2 — the boundary extractor would only be needed if we
+  ever decided to parse rather than reject), or §11.4 `realm="…"`
+  auth-param decoding once the caller has split the challenge on
+  its §11.2 `,` boundaries. 23 new unit tests cover: empty input,
+  whitespace-only input, semicolon-only input, single-token value,
+  optional-leading-`;` invariant, §5.6.6 name lowercasing,
+  quoted-string value unwrap, §5.6.4 quoted-pair collapse on the
+  value, `;` inside quoted-string preserved (no premature slot
+  end), `\"` inside quoted-string preserved (no premature value
+  close), multi-entry order preservation, empty-slot tolerance per
+  §5.6.1, missing-`=` skipped, whitespace-around-`=` skipped (and
+  the only-before / only-after sub-cases), non-token name skipped,
+  non-token unquoted value skipped, unterminated-quoted-string
+  skipped, OWS around `;` tolerated, obs-text (U+00E9 multi-byte
+  UTF-8) inside quoted-string preserved, §11.4 realm shape, comma
+  inside value is not a §5.6.6 slot separator, token values with
+  `.` `_` `-` accepted, and a §5.6.6 → §5.6.4 layering coupling
+  test. The helper is also re-exported through the
+  `#[doc(hidden)] pub mod __fuzz` gate so the cargo-fuzz
+  `parse_headers` harness exercises it on arbitrary input
+  alongside every other §3.2.4 / §5.6.4 / §5.6.7 / §8.8.3 /
+  §10.2.3 / §14.3 / §14.4 parser; three new seed-corpus entries
+  (`parameters_charset`, `parameters_boundary_quoted`,
+  `parameters_multiple`) seed the corpus with canonical happy-path
+  inputs.
+
 - RFC 9110 §5.6.4 `quoted-string` unwrap primitive. New internal
   helper `unquote_string(&str) -> Option<Cow<str>>` takes a complete
   DQUOTE-wrapped `quoted-string` field value and returns the
