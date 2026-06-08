@@ -250,6 +250,33 @@ The §10.2.3 grammar is intentionally strict:
   (IMF-fixdate / rfc850-date / asctime-date) — random tokens
   like `"never"` or `"Tomorrow at noon"` produce `None`.
 
+## Quoted-string unwrap (RFC 9110 §5.6.4)
+
+A small `unquote_string` helper turns a DQUOTE-wrapped
+`quoted-string` field value (or the RHS of a §5.6.6 parameter, or an
+auth-param value, etc.) into its logical octet sequence — collapsing
+every `quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )` to the
+single octet that followed the backslash, as §5.6.4 makes a hard
+MUST for any recipient that processes the value.
+
+The helper is used by the cargo-fuzz `parse_headers` harness so any
+panic mode is found by fuzzing; no in-driver caller exists yet (the
+§15.3.7.2 multipart rejection only needs the bare media-type
+prefix and the §8.8.3 `entity-tag` production explicitly excludes
+`quoted-pair` from `etagc`). The primitive is in place ready to back
+any future per-parameter inspection — e.g. a §5.6.6 / §8.3.1
+`charset="utf-8"` parameter extractor, or the `realm="…"` value
+inside a §11.4 `WWW-Authenticate` challenge.
+
+The unwrap rejects anything that is not a syntactically valid
+`quoted-string`: missing DQUOTEs, bare control bytes outside
+`qdtext`, a trailing lone backslash with no octet to escape, or a
+backslash followed by an octet outside the §5.6.4 `quoted-pair` RHS
+(notably bare CR or LF, which would unbalance the field line). On
+the happy path with no escapes present the return is a borrow of
+the input slice (zero allocations); only the slow path of an actual
+escape allocates.
+
 ## Obs-fold normalisation (RFC 7230 §3.2.4)
 
 Field values picked off of the response are normalised through a
@@ -292,6 +319,7 @@ plus the unified §5.6.7 dispatcher `parse_http_date`,
 `is_multipart_byteranges_content_type` (§8.3 / §14.6 / §15.3.7.2),
 `format_retry_after_hint` (§10.2.3 HEAD surfacing helper),
 `normalize_obs_fold` (RFC 7230 §3.2.4 obs-fold normaliser),
+`unquote_string` (RFC 9110 §5.6.4 quoted-string unwrap),
 and the composite
 `derive_strong_validator` (§13.1.5 + §8.8.2.2 + §8.8.3).
 The harness

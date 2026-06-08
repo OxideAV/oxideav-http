@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- RFC 9110 §5.6.4 `quoted-string` unwrap primitive. New internal
+  helper `unquote_string(&str) -> Option<Cow<str>>` takes a complete
+  DQUOTE-wrapped `quoted-string` field value and returns the
+  unescaped logical octet sequence — collapsing each
+  `quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )` to the single
+  octet that followed the backslash, satisfying §5.6.4's hard MUST:
+  "Recipients that process the value of a quoted-string MUST handle
+  a quoted-pair as if it were replaced by the octet following the
+  backslash." The function rejects malformed inputs (missing DQUOTEs,
+  bare control bytes outside `qdtext`, trailing lone backslash with
+  no octet to escape, and backslash followed by an octet outside the
+  §5.6.4 `quoted-pair` RHS — notably bare CR / LF, which would
+  unbalance the field line). The hot path with no escapes returns
+  `Cow::Borrowed` of the inner slice (zero allocations); only the
+  slow path of an actual escape allocates. The §15.3.7.2 multipart
+  rejection only needs the bare media-type prefix and the §8.8.3
+  `entity-tag` production explicitly excludes `quoted-pair` from
+  `etagc`, so no in-driver caller exists yet — the primitive is in
+  place ready to back any future per-parameter inspection
+  (§5.6.6 / §8.3.1 parameter values, §11.4 auth-param values, etc.).
+  17 new unit tests cover: empty-pair (`""` → empty borrowed),
+  escape-free Cow::Borrowed hot path, quoted-DQUOTE collapse,
+  quoted-backslash collapse, every malformed-input rejection branch
+  (missing leading DQUOTE, missing trailing DQUOTE, single DQUOTE,
+  bare unwrapped value, empty input, trailing lone backslash, bare
+  CR / LF after backslash, bare body DQUOTE, bare BEL control byte
+  in body), obs-text byte acceptance (high U+00E9 byte in body),
+  escape-preserving obs-text byte through `\<C3>`, slow-path
+  Cow::Owned invariant, and a coupling test pinning the §5.6.4 →
+  §5.6.6 layering with a parameter-value that contains the
+  semicolon delimiter. The helper is also re-exported through the
+  `#[doc(hidden)] pub mod __fuzz` gate so the cargo-fuzz
+  `parse_headers` harness exercises it on arbitrary input alongside
+  every other §3.2.4 / §5.6.7 / §8.8.3 / §10.2.3 / §14.3 / §14.4
+  parser; three new seed-corpus entries (`quoted_string_plain`,
+  `quoted_string_escaped_dquote`, `quoted_string_escaped_backslash`)
+  seed the corpus with canonical happy-path inputs.
+
 - RFC 7230 §3.2.4 obs-fold normalisation. New internal helper
   `normalize_obs_fold(&str) -> Cow<str>` collapses each `obs-fold =
   CRLF 1*( SP / HTAB )` occurrence to a single ASCII space, fulfilling

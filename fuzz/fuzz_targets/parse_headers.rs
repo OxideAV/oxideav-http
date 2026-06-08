@@ -42,6 +42,9 @@
 //!   exercised on the HEAD non-success branch.
 //! * `normalize_obs_fold` — RFC 7230 §3.2.4 obs-fold normalisation
 //!   helper. Contract: never panics, output is always valid UTF-8.
+//! * `unquote_string` — RFC 9110 §5.6.4 `quoted-string` unwrap with
+//!   `quoted-pair` collapse. Contract: never panics, every output
+//!   string (when `Some`) is valid UTF-8.
 //! * `derive_strong_validator` — §13.1.5 + §8.8.2.2 + §8.8.3
 //!   composite that picks an If-Range value from a HEAD's three
 //!   relevant headers.
@@ -64,6 +67,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = __fuzz::is_multipart_byteranges_content_type(s);
         let _ = __fuzz::format_retry_after_hint(s);
         let _ = __fuzz::normalize_obs_fold(s);
+        let _ = __fuzz::unquote_string(s);
     }
 
     // Pass 2: NUL-split the input into up to three fields for the

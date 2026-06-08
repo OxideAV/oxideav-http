@@ -1115,6 +1115,121 @@ fn normalize_obs_fold(s: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Unwrap a `quoted-string` per RFC 9110 §5.6.4 into its logical
+/// value (the byte sequence the producer meant to convey, with every
+/// `quoted-pair` collapsed to the octet that followed the backslash).
+///
+/// ```text
+/// quoted-string = DQUOTE *( qdtext / quoted-pair ) DQUOTE
+/// qdtext        = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text
+/// quoted-pair   = "\" ( HTAB / SP / VCHAR / obs-text )
+/// ```
+///
+/// §5.6.4 makes the unescape a hard MUST: "Recipients that process the
+/// value of a quoted-string MUST handle a quoted-pair as if it were
+/// replaced by the octet following the backslash." Any caller that
+/// inspects a quoted-string's contents — media-type parameters per
+/// §5.6.6 / §8.3.1, auth-params per §11.4, the `Link` header's
+/// `title="…"` per RFC 8288, etc. — must run the input through this
+/// step before pattern-matching on its bytes; otherwise a server's
+/// `"foo\"bar"` reads as a value boundary instead of a literal `"`.
+///
+/// Returns `None` when the input is not a syntactically valid
+/// `quoted-string`:
+///
+/// - missing leading or trailing `"`,
+/// - any inner byte that is neither `qdtext` nor a `quoted-pair`,
+/// - a trailing lone `\` with no octet to escape,
+/// - a `\` followed by an octet outside the §5.6.4 `quoted-pair` RHS
+///   (`HTAB / SP / VCHAR / obs-text`; notably bare CR/LF cannot be
+///   quoted-paired — they would unbalance the field line).
+///
+/// On success returns the unescaped logical value. When the body
+/// carries no `\`-escapes the return is a borrow of the input slice
+/// (zero allocations on the common path).
+///
+/// Currently exercised by the unit-test suite and the cargo-fuzz
+/// `parse_headers` harness (through the `__fuzz` re-export gate); no
+/// in-driver caller yet, since the §15.3.7.2 multipart rejection
+/// only needs the bare type/subtype and the §8.8.3 `entity-tag`
+/// production explicitly excludes `quoted-pair` from `etagc`. The
+/// primitive is in place ready to back any future per-parameter
+/// inspection a §5.6.6 / §8.3.1 / §11.4 parser would need.
+#[allow(dead_code)]
+fn unquote_string(s: &str) -> Option<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
+    let bytes = s.as_bytes();
+    // Must be DQUOTE-wrapped and at least two bytes long for the
+    // empty `""` case.
+    if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
+        return None;
+    }
+    let inner = &bytes[1..bytes.len() - 1];
+    // Fast pre-scan: validate every byte and detect whether any
+    // quoted-pair is present. If none, we can return a Cow::Borrowed
+    // slice of the original &str (zero allocation).
+    let mut i = 0;
+    let mut has_escape = false;
+    while i < inner.len() {
+        let b = inner[i];
+        if b == b'\\' {
+            // quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )
+            // VCHAR = %x21-7E; obs-text = %x80-FF.
+            let nxt = *inner.get(i + 1)?;
+            let ok = nxt == 0x09 || nxt == 0x20 || (0x21..=0x7E).contains(&nxt) || nxt >= 0x80;
+            if !ok {
+                return None;
+            }
+            has_escape = true;
+            i += 2;
+        } else {
+            // qdtext = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text
+            let ok = b == 0x09
+                || b == 0x20
+                || b == 0x21
+                || (0x23..=0x5B).contains(&b)
+                || (0x5D..=0x7E).contains(&b)
+                || b >= 0x80;
+            if !ok {
+                return None;
+            }
+            i += 1;
+        }
+    }
+    if !has_escape {
+        // SAFETY-equivalent: the inner slice is a substring of `s`
+        // bounded on both ends by an ASCII byte (`"`), so the byte
+        // offsets [1, len-1] fall on UTF-8 code-point boundaries.
+        return Some(Cow::Borrowed(
+            std::str::from_utf8(inner).expect("inner slice is UTF-8 by construction"),
+        ));
+    }
+    // Slow path: collapse each quoted-pair.
+    let mut out: Vec<u8> = Vec::with_capacity(inner.len());
+    let mut i = 0;
+    while i < inner.len() {
+        let b = inner[i];
+        if b == b'\\' {
+            // Validated above; emit the next octet verbatim.
+            out.push(inner[i + 1]);
+            i += 2;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    // The body is byte-for-byte derived from a valid UTF-8 slice by
+    // copying either a qdtext octet or the octet following a `\`,
+    // both of which originated as bytes within `s`. The escape's
+    // RHS may break a multi-byte UTF-8 sequence boundary if a
+    // sender backslash-escaped a single continuation byte, so we
+    // must run a checked conversion rather than assume validity.
+    match String::from_utf8(out) {
+        Ok(decoded) => Some(Cow::Owned(decoded)),
+        Err(_) => None,
+    }
+}
+
 /// Parse an `ETag` field value per RFC 9110 §8.8.3 grammar:
 ///
 /// ```text
@@ -1729,6 +1844,14 @@ pub mod __fuzz {
     /// function never panics and always yields valid UTF-8.
     pub fn normalize_obs_fold(s: &str) -> String {
         super::normalize_obs_fold(s).into_owned()
+    }
+    /// Fuzz-only wrapper for [`super::unquote_string`] — exercises the
+    /// RFC 9110 §5.6.4 `quoted-string` unwrap (DQUOTE-stripping +
+    /// `quoted-pair` collapsing) on arbitrary input. Returns the
+    /// decoded value when the input parses, `None` otherwise; either
+    /// outcome must be reachable without a panic.
+    pub fn unquote_string(s: &str) -> Option<String> {
+        super::unquote_string(s).map(|c| c.into_owned())
     }
 }
 
@@ -3718,6 +3841,174 @@ mod tests {
         // the expected single-space separator.
         let normalised = normalize_obs_fold(folded);
         assert!(parse_imf_fixdate(&normalised).is_some());
+    }
+
+    // --- §5.6.4 quoted-string unwrap ---------------------------------
+
+    #[test]
+    fn unquote_string_empty_pair_decodes_to_empty_borrowed() {
+        // The minimal §5.6.4 input is `""` (two DQUOTEs, no content).
+        // It is well-formed and decodes to the empty string. With no
+        // escapes present the return must be a borrow (the inner
+        // slice is the empty &str inside the input).
+        let v = unquote_string("\"\"").unwrap();
+        assert_eq!(&*v, "");
+        assert!(matches!(v, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn unquote_string_escape_free_returns_cow_borrowed() {
+        // No `\` in the body — the §5.6.4 unescape pass is a no-op
+        // and the implementation must short-circuit to Cow::Borrowed
+        // so a hot path that never sees escapes stays allocation-free.
+        let v = unquote_string("\"plain text\"").unwrap();
+        assert_eq!(&*v, "plain text");
+        assert!(matches!(v, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn unquote_string_quoted_dquote_collapses_to_one_dquote() {
+        // `quoted-pair = "\" ( … VCHAR … )` — DQUOTE is VCHAR, so the
+        // pair is well-formed and the §5.6.4 MUST collapses it to the
+        // single octet that followed the backslash.
+        let v = unquote_string("\"a\\\"b\"").unwrap();
+        assert_eq!(&*v, "a\"b");
+        assert!(matches!(v, std::borrow::Cow::Owned(_)));
+    }
+
+    #[test]
+    fn unquote_string_quoted_backslash_collapses_to_one_backslash() {
+        // Same rule applied to `\` itself.
+        let v = unquote_string("\"a\\\\b\"").unwrap();
+        assert_eq!(&*v, "a\\b");
+    }
+
+    #[test]
+    fn unquote_string_missing_leading_dquote_rejects() {
+        assert!(unquote_string("hello\"").is_none());
+    }
+
+    #[test]
+    fn unquote_string_missing_trailing_dquote_rejects() {
+        assert!(unquote_string("\"hello").is_none());
+    }
+
+    #[test]
+    fn unquote_string_single_dquote_rejects() {
+        // One byte cannot match the `DQUOTE *(...) DQUOTE` shape.
+        assert!(unquote_string("\"").is_none());
+    }
+
+    #[test]
+    fn unquote_string_unwrapped_rejects() {
+        assert!(unquote_string("hello").is_none());
+    }
+
+    #[test]
+    fn unquote_string_empty_rejects() {
+        assert!(unquote_string("").is_none());
+    }
+
+    #[test]
+    fn unquote_string_trailing_lone_backslash_rejects() {
+        // `\` with nothing after it cannot satisfy the
+        // `quoted-pair = "\" ( … )` rule — there is no octet to
+        // escape.
+        assert!(unquote_string("\"abc\\\"").is_none());
+    }
+
+    #[test]
+    fn unquote_string_quoted_pair_with_cr_or_lf_rejects() {
+        // `quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )` — CR
+        // (0x0D) and LF (0x0A) are control bytes outside that RHS,
+        // and a quoted-pair'd bare line-ending would unbalance the
+        // field line at the framing layer.
+        let cr = [b'"', b'a', b'\\', b'\r', b'b', b'"'];
+        assert!(unquote_string(std::str::from_utf8(&cr).unwrap()).is_none());
+        let lf = [b'"', b'a', b'\\', b'\n', b'b', b'"'];
+        assert!(unquote_string(std::str::from_utf8(&lf).unwrap()).is_none());
+    }
+
+    #[test]
+    fn unquote_string_bare_qdtext_excluded_byte_rejects() {
+        // `qdtext` excludes `"` (0x22) and `\` (0x5C). A bare `"`
+        // inside the body without an escape would terminate the
+        // string at the framing parser; our unwrap, given a slice
+        // that includes the inner `"`, must refuse rather than
+        // silently truncate.
+        // We construct `"a"b"` — bytes 0x22 0x61 0x22 0x62 0x22 —
+        // where the middle 0x22 is bare qdtext (excluded), so the
+        // unwrap must refuse.
+        assert!(unquote_string("\"a\"b\"").is_none());
+        // Bare `\` (without a following octet pair) is the trailing
+        // case covered above; bare `\` followed by a non-escapable
+        // byte is the CR/LF case. There's no remaining bare-qdtext
+        // path for `\` to reach this branch through.
+    }
+
+    #[test]
+    fn unquote_string_bare_control_byte_rejects() {
+        // `qdtext = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text`.
+        // Bare BEL (0x07) is below the SP/HTAB range and outside any
+        // qdtext slot, so the body fails validation.
+        let bel = [b'"', b'a', 0x07, b'b', b'"'];
+        assert!(unquote_string(std::str::from_utf8(&bel).unwrap()).is_none());
+    }
+
+    #[test]
+    fn unquote_string_obs_text_byte_in_body_accepted() {
+        // `qdtext` includes `obs-text = %x80-FF`. A literal high
+        // byte is well-formed `qdtext` — the unwrap must accept it
+        // and the decoded value must round-trip through valid UTF-8.
+        // U+00E9 (é) is 0xC3 0xA9 — both bytes are in the obs-text
+        // range, the resulting borrow is the same UTF-8 sequence.
+        let v = unquote_string("\"\u{00e9}\"").unwrap();
+        assert_eq!(&*v, "\u{00e9}");
+        // No `\` present, so borrowing is required for the hot path.
+        assert!(matches!(v, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn unquote_string_escape_preserving_obs_text_byte_accepted() {
+        // `quoted-pair`'s RHS is `HTAB / SP / VCHAR / obs-text`, so
+        // an escaped obs-text byte is permitted and must collapse to
+        // that byte. We escape only the first byte of U+00E9 so the
+        // pair RHS is exactly one obs-text octet (0xC3), then let
+        // the trailing continuation byte (0xA9) fall through as
+        // bare qdtext. The decoded UTF-8 is the same `é`.
+        let inp: [u8; 5] = [b'"', b'\\', 0xC3, 0xA9, b'"'];
+        let v = unquote_string(std::str::from_utf8(&inp).unwrap()).unwrap();
+        assert_eq!(v.as_bytes(), &[0xC3, 0xA9]);
+    }
+
+    #[test]
+    fn unquote_string_only_unescapes_in_slow_path() {
+        // Belt-and-braces invariant: an input that contains at least
+        // one `\` must yield `Cow::Owned` even if the decoded value
+        // happens to equal a substring of the input. This guards
+        // against a future "optimisation" that aliased the body
+        // through Cow::Borrowed when no character moved.
+        let v = unquote_string("\"a\\bc\"").unwrap();
+        assert_eq!(&*v, "abc");
+        assert!(matches!(v, std::borrow::Cow::Owned(_)));
+    }
+
+    #[test]
+    fn unquote_string_decodes_used_in_media_type_parameter_rhs() {
+        // §5.6.6 says `parameter-value = ( token / quoted-string )`.
+        // A media type carrying `name="weird;value"` — where the
+        // body contains the parameter delimiter `;` — must round
+        // through the §5.6.4 unwrap before the consumer pattern-
+        // matches on its contents. This is a coupling test: it
+        // pins the §5.6.4 → §5.6.6 layering.
+        let v = unquote_string("\"weird;value\"").unwrap();
+        assert_eq!(&*v, "weird;value");
+        // §8.3.1's `boundary="..."` parameter on multipart media
+        // types is the most common in-the-wild caller of this
+        // primitive; the unwrap must hand back the inner bytes
+        // verbatim regardless of which bytes those are.
+        let v = unquote_string("\"--my\\\"boundary--\"").unwrap();
+        assert_eq!(&*v, "--my\"boundary--");
     }
 
     #[test]
