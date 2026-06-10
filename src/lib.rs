@@ -1418,6 +1418,91 @@ fn parse_one_parameter(slot: &str) -> Option<(String, String)> {
     Some((name.to_ascii_lowercase(), decoded_value))
 }
 
+/// A parsed §8.3.1 `media-type`: `(lowercased type, lowercased subtype,
+/// §5.6.6 parameters)`.
+type MediaType = (String, String, Vec<(String, String)>);
+
+/// Parse a `media-type` field value per RFC 9110 §8.3.1 grammar:
+///
+/// ```text
+/// media-type = type "/" subtype parameters
+/// type       = token
+/// subtype    = token
+/// ```
+///
+/// (`parameters` is the §5.6.6 production already parsed by
+/// [`parse_parameters`].)
+///
+/// Returns `Some((type, subtype, params))` where `type` and `subtype`
+/// are the lowercased tokens — §8.3.1: "The type and subtype tokens are
+/// case-insensitive." — and `params` is the §5.6.6 `Vec<(name, value)>`
+/// of the trailing parameters (already lowercase-named and quoted-pair
+/// decoded). Returns `None` when the value is not a syntactically valid
+/// `media-type`: a missing `/`, an empty / non-`token` type or subtype,
+/// or a slash that does not separate exactly one type from one subtype.
+///
+/// Parameter *values* are NOT case-folded here — §8.3.1: "Parameter
+/// values might or might not be case-sensitive, depending on the
+/// semantics of the parameter name." A consumer that knows a given
+/// parameter is case-insensitive (e.g. `charset` per §8.3.2 / [RFC2046]
+/// §4.1.2) folds the value itself.
+///
+/// The OWS posture matches the rest of the driver: leading / trailing
+/// OWS on the whole value is trimmed, and OWS between the type/subtype
+/// and the first `;` is tolerated (§8.3.1's `parameters` opens with
+/// `*( OWS ";" OWS … )`, so the gap before the first `;` is OWS).
+///
+/// This is the §8.3.1 composition the §5.6.6 parameters helper was built
+/// to enable — e.g. a `charset` extractor on `Content-Type` becomes a
+/// `parse_media_type(ct)` then a case-insensitive `params` lookup for
+/// `"charset"`, with the §8.3.2 case-insensitive fold applied by the
+/// caller. No in-driver caller exists yet (the §15.3.7.2 multipart
+/// rejection only needs the bare `type/subtype` prefix and uses the
+/// narrower [`is_multipart_byteranges_content_type`]); the primitive is
+/// in place ready to back any future per-parameter media-type
+/// inspection.
+#[allow(dead_code)]
+fn parse_media_type(s: &str) -> Option<MediaType> {
+    // §5.6.3 OWS strip on the whole value.
+    let s = s.trim_matches([' ', '\t']);
+    if s.is_empty() {
+        return None;
+    }
+    // Split off the §5.6.6 `parameters` tail at the first *top-level*
+    // `;`. A `;` cannot appear in `type` or `subtype` (both are `token`,
+    // and `;` is not a `tchar` per §5.6.2), so the first `;` in the
+    // value unambiguously opens the parameters tail — no quoted-string
+    // awareness is needed at this split (the type/subtype part has no
+    // quoted-strings).
+    let (media, params_tail) = match s.split_once(';') {
+        Some((m, rest)) => (m, Some(rest)),
+        None => (s, None),
+    };
+    // `parameters` opens with `*( OWS ";" OWS … )`, so OWS between the
+    // subtype and the first `;` is legal; trim it off the media part.
+    let media = media.trim_end_matches([' ', '\t']);
+    // §8.3.1: `type "/" subtype`. Exactly one `/` separating two tokens.
+    let (ty, sub) = media.split_once('/')?;
+    // A second `/` in the subtype would make it a non-`token` (`/` is
+    // not a `tchar`), so `is_token(sub)` already rejects it; the
+    // explicit `split_once` takes only the first `/`.
+    if !is_token(ty) || !is_token(sub) {
+        return None;
+    }
+    // §8.3.1: type and subtype are case-insensitive — normalise to
+    // lowercase so a consumer can compare without re-folding.
+    let ty = ty.to_ascii_lowercase();
+    let sub = sub.to_ascii_lowercase();
+    // §5.6.6 parameters tail (empty when there was no `;`). The helper
+    // already tolerates a leading `;` / OWS, so the post-`;` remainder
+    // is handed straight through.
+    let params = match params_tail {
+        Some(rest) => parse_parameters(rest),
+        None => Vec::new(),
+    };
+    Some((ty, sub, params))
+}
+
 /// Parse an `ETag` field value per RFC 9110 §8.8.3 grammar:
 ///
 /// ```text
@@ -2050,6 +2135,15 @@ pub mod __fuzz {
     /// `(name, value)` pair must be valid UTF-8.
     pub fn parse_parameters(s: &str) -> usize {
         super::parse_parameters(s).len()
+    }
+    /// Fuzz-only wrapper for [`super::parse_media_type`] — exercises the
+    /// RFC 9110 §8.3.1 `media-type = type "/" subtype parameters` grammar
+    /// on arbitrary input. Returns `Some(parameter-count)` when the value
+    /// is a syntactically valid media-type, `None` otherwise — both
+    /// outcomes must be reachable without a panic, and any returned
+    /// `(type, subtype, params)` strings must be valid UTF-8.
+    pub fn parse_media_type(s: &str) -> Option<usize> {
+        super::parse_media_type(s).map(|(_, _, p)| p.len())
     }
 }
 
@@ -4492,6 +4586,154 @@ mod tests {
             .unwrap()
             .1;
         assert_eq!(&*direct, via_params);
+    }
+
+    // --- RFC 9110 §8.3.1 media-type (parse_media_type) ----------------
+
+    #[test]
+    fn parse_media_type_bare_type_subtype_no_parameters() {
+        // §8.3.1 `media-type = type "/" subtype parameters` with an
+        // empty parameters tail.
+        let (ty, sub, params) = parse_media_type("text/html").unwrap();
+        assert_eq!(ty, "text");
+        assert_eq!(sub, "html");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn parse_media_type_lowercases_type_and_subtype_per_8_3_1() {
+        // §8.3.1: "The type and subtype tokens are case-insensitive."
+        // `Text/HTML` and `text/html` describe the same media type.
+        let (ty, sub, _) = parse_media_type("Text/HTML").unwrap();
+        assert_eq!(ty, "text");
+        assert_eq!(sub, "html");
+    }
+
+    #[test]
+    fn parse_media_type_canonical_charset_example() {
+        // §8.3.1 worked example: `text/html;charset=utf-8`.
+        let (ty, sub, params) = parse_media_type("text/html;charset=utf-8").unwrap();
+        assert_eq!(ty, "text");
+        assert_eq!(sub, "html");
+        assert_eq!(params, vec![("charset".to_owned(), "utf-8".to_owned())]);
+    }
+
+    #[test]
+    fn parse_media_type_quoted_charset_example() {
+        // §8.3.1 worked example: `text/html; charset="utf-8"` — the
+        // quoted value unwraps to the same logical octets per §5.6.4,
+        // and OWS after the `;` is tolerated by the §5.6.6 helper.
+        let (ty, sub, params) = parse_media_type("text/html; charset=\"utf-8\"").unwrap();
+        assert_eq!(ty, "text");
+        assert_eq!(sub, "html");
+        assert_eq!(params, vec![("charset".to_owned(), "utf-8".to_owned())]);
+    }
+
+    #[test]
+    fn parse_media_type_does_not_case_fold_parameter_value() {
+        // §8.3.1: "Parameter values might or might not be
+        // case-sensitive." The helper preserves the value verbatim;
+        // the §8.3.2 case-insensitive charset fold is the caller's job.
+        let (_, _, params) = parse_media_type("text/html;charset=UTF-8").unwrap();
+        assert_eq!(params, vec![("charset".to_owned(), "UTF-8".to_owned())]);
+    }
+
+    #[test]
+    fn parse_media_type_lowercases_parameter_name_per_5_6_6() {
+        // §5.6.6: parameter-name is case-insensitive (the §5.6.6 helper
+        // lowercases it); the §8.3.1 worked example `Charset` folds.
+        let (_, _, params) = parse_media_type("Text/HTML;Charset=\"utf-8\"").unwrap();
+        assert_eq!(params, vec![("charset".to_owned(), "utf-8".to_owned())]);
+    }
+
+    #[test]
+    fn parse_media_type_multiple_parameters_preserved_in_order() {
+        let (ty, sub, params) =
+            parse_media_type("application/dash+xml; profiles=\"a,b\"; foo=bar").unwrap();
+        assert_eq!(ty, "application");
+        assert_eq!(sub, "dash+xml");
+        assert_eq!(
+            params,
+            vec![
+                ("profiles".to_owned(), "a,b".to_owned()),
+                ("foo".to_owned(), "bar".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_media_type_ows_around_value_and_before_semicolon_tolerated() {
+        // Leading/trailing OWS on the whole value is trimmed, and the
+        // OWS between the subtype and the first `;` is part of the
+        // §8.3.1 `parameters` `*( OWS ";" OWS … )` opener.
+        let (ty, sub, params) =
+            parse_media_type("  multipart/byteranges ; boundary=ABC  ").unwrap();
+        assert_eq!(ty, "multipart");
+        assert_eq!(sub, "byteranges");
+        assert_eq!(params, vec![("boundary".to_owned(), "ABC".to_owned())]);
+    }
+
+    #[test]
+    fn parse_media_type_boundary_with_quoted_semicolon_preserved() {
+        // The §5.6.6 splitter is quoted-string-aware: a `;` inside the
+        // boundary value is part of the value, not a new slot.
+        let (_, _, params) = parse_media_type("multipart/byteranges; boundary=\"a;b\"").unwrap();
+        assert_eq!(params, vec![("boundary".to_owned(), "a;b".to_owned())]);
+    }
+
+    #[test]
+    fn parse_media_type_missing_slash_rejected() {
+        // §8.3.1 requires `type "/" subtype` — no `/` is not a
+        // media-type.
+        assert!(parse_media_type("text").is_none());
+        assert!(parse_media_type("text;charset=utf-8").is_none());
+    }
+
+    #[test]
+    fn parse_media_type_empty_type_or_subtype_rejected() {
+        // `type` / `subtype` are `token`, and `is_token` rejects empty.
+        assert!(parse_media_type("/html").is_none());
+        assert!(parse_media_type("text/").is_none());
+        assert!(parse_media_type("/").is_none());
+    }
+
+    #[test]
+    fn parse_media_type_non_token_type_or_subtype_rejected() {
+        // A second `/` makes the subtype a non-`token` (`/` is not a
+        // `tchar` per §5.6.2); a space inside either token is likewise
+        // not a `tchar`.
+        assert!(parse_media_type("text/ht/ml").is_none());
+        assert!(parse_media_type("te xt/html").is_none());
+        assert!(parse_media_type("text/ht ml").is_none());
+    }
+
+    #[test]
+    fn parse_media_type_empty_and_whitespace_input_rejected() {
+        assert!(parse_media_type("").is_none());
+        assert!(parse_media_type("   ").is_none());
+        assert!(parse_media_type("\t").is_none());
+    }
+
+    #[test]
+    fn parse_media_type_garbage_parameter_slots_skipped_media_survives() {
+        // The §5.6.6 helper's defensive posture flows through: a
+        // garbage parameter slot is dropped, but the type/subtype and
+        // the legitimate sibling parameter survive.
+        let (ty, sub, params) = parse_media_type("text/plain; =novalue; charset=utf-8").unwrap();
+        assert_eq!(ty, "text");
+        assert_eq!(sub, "plain");
+        assert_eq!(params, vec![("charset".to_owned(), "utf-8".to_owned())]);
+    }
+
+    #[test]
+    fn parse_media_type_coupling_with_is_multipart_byteranges() {
+        // Coupling test: the narrow §15.3.7.2 multipart predicate and
+        // the general §8.3.1 parser must agree on the type/subtype of a
+        // boundary-bearing multipart/byteranges value.
+        let ct = "multipart/byteranges; boundary=END";
+        assert!(is_multipart_byteranges_content_type(ct));
+        let (ty, sub, _) = parse_media_type(ct).unwrap();
+        assert_eq!(format!("{ty}/{sub}"), "multipart/byteranges");
     }
 
     #[test]

@@ -315,6 +315,43 @@ processed by this helper one slot at a time).
 The helper is exercised by 23 unit tests and the cargo-fuzz
 `parse_headers` harness through the `__fuzz` re-export gate.
 
+## Media-type parse (RFC 9110 §8.3.1)
+
+`parse_media_type` composes the §5.6.2 `is_token` and §5.6.6
+`parse_parameters` primitives into the §8.3.1 production
+`media-type = type "/" subtype parameters`. It returns
+`(type, subtype, params)` where:
+
+- `type` and `subtype` are lowercased — §8.3.1: "The type and subtype
+  tokens are case-insensitive." So `Text/HTML` and `text/html` both
+  yield `("text", "html", …)`.
+- `params` is the §5.6.6 ordered `Vec<(lowercase-name, decoded-value)>`
+  of the trailing parameters, already quoted-pair-collapsed per §5.6.4.
+
+Parameter *values* are NOT case-folded — §8.3.1: "Parameter values
+might or might not be case-sensitive, depending on the semantics of the
+parameter name." A consumer that knows a parameter is case-insensitive
+(e.g. `charset` per §8.3.2 / RFC 2046 §4.1.2) folds the value itself.
+This is exactly the layering the §5.6.6 helper was built to enable: a
+`charset` extractor on `Content-Type` is `parse_media_type(ct)` then a
+case-insensitive lookup of `"charset"` in `params`.
+
+The value is rejected (`None`) when it is not a syntactically valid
+media-type: a missing `/`, an empty or non-`token` type or subtype, a
+second `/` (which makes the subtype a non-`token` since `/` is not a
+`tchar`), or empty / whitespace-only input. Leading/trailing OWS on the
+whole value, and OWS between the subtype and the first `;`, are
+tolerated (the §8.3.1 `parameters` tail opens with `*( OWS ";" OWS … )`).
+Garbage parameter slots are dropped by the §5.6.6 helper while the
+type/subtype and legitimate sibling parameters survive.
+
+No in-driver caller exists yet — the §15.3.7.2 multipart rejection only
+needs the bare `type/subtype` prefix and uses the narrower
+`is_multipart_byteranges_content_type`. The primitive is in place ready
+to back any future per-parameter media-type inspection. Exercised by 16
+unit tests (including a coupling test pinning agreement with the narrow
+multipart predicate) and the cargo-fuzz `parse_headers` harness.
+
 ## Obs-fold normalisation (RFC 7230 §3.2.4)
 
 Field values picked off of the response are normalised through a
@@ -360,6 +397,8 @@ plus the unified §5.6.7 dispatcher `parse_http_date`,
 `unquote_string` (RFC 9110 §5.6.4 quoted-string unwrap),
 `parse_parameters` (RFC 9110 §5.6.6 semicolon-delimited
 `name=value` list with quoted-string-aware splitting),
+`parse_media_type` (RFC 9110 §8.3.1 `media-type = type "/" subtype
+parameters`),
 and the composite
 `derive_strong_validator` (§13.1.5 + §8.8.2.2 + §8.8.3).
 The harness

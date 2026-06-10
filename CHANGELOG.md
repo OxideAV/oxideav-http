@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- RFC 9110 §8.3.1 `media-type` parser. New internal helper
+  `parse_media_type(&str) -> Option<(String, String, Vec<(String,
+  String)>)>` composes the §5.6.2 `is_token` and §5.6.6
+  `parse_parameters` primitives into the §8.3.1 production
+  `media-type = type "/" subtype parameters` (`type = token`,
+  `subtype = token`). It returns the lowercased `type` and `subtype`
+  — §8.3.1: "The type and subtype tokens are case-insensitive." — plus
+  the §5.6.6 ordered `Vec<(lowercase-name, decoded-value)>` of the
+  trailing parameters (already quoted-pair-collapsed per §5.6.4).
+  Parameter *values* are NOT case-folded — §8.3.1: "Parameter values
+  might or might not be case-sensitive, depending on the semantics of
+  the parameter name" — so a consumer that knows a parameter is
+  case-insensitive (e.g. `charset` per §8.3.2 / RFC 2046 §4.1.2) folds
+  the value itself. This is the §8.3.1 composition the §5.6.6 helper
+  was built to enable: a `charset` extractor on `Content-Type` becomes
+  a `parse_media_type(ct)` then a case-insensitive `"charset"` lookup
+  in the returned params. The value is rejected (`None`) when it is not
+  a syntactically valid media-type: a missing `/`, an empty / non-`token`
+  type or subtype, a second `/` (which makes the subtype a non-`token`
+  since `/` is not a §5.6.2 `tchar`), or empty / whitespace-only input.
+  Leading/trailing OWS on the whole value and OWS between the subtype
+  and the first `;` are tolerated (the §8.3.1 `parameters` tail opens
+  with `*( OWS ";" OWS … )`); garbage parameter slots are dropped by the
+  §5.6.6 helper while the type/subtype and legitimate sibling parameters
+  survive. No in-driver caller exists yet — the §15.3.7.2 multipart
+  rejection only needs the bare `type/subtype` prefix and uses the
+  narrower `is_multipart_byteranges_content_type`; the primitive is in
+  place ready to back any future per-parameter media-type inspection.
+  16 new unit tests cover: bare type/subtype (no params), §8.3.1
+  type/subtype lowercasing, the §8.3.1 worked examples
+  (`text/html;charset=utf-8` and `text/html; charset="utf-8"`),
+  no-fold-on-parameter-value (§8.3.1) vs lowercase-on-parameter-name
+  (§5.6.6), multi-parameter order preservation, OWS tolerance (whole
+  value + before the first `;`), quoted-`;`-in-boundary preserved,
+  missing-`/` rejection, empty-type / empty-subtype rejection,
+  non-`token` (second `/` and embedded SP) rejection, empty /
+  whitespace-only rejection, garbage-parameter-slot tolerance, and a
+  coupling test pinning agreement with the narrow §15.3.7.2 multipart
+  predicate. The helper is re-exported through the `#[doc(hidden)] pub
+  mod __fuzz` gate so the cargo-fuzz `parse_headers` harness exercises
+  it on arbitrary input; three new seed-corpus entries
+  (`media_type_charset`, `media_type_charset_quoted`,
+  `media_type_multipart_boundary`) seed the canonical happy-path inputs.
+
 - RFC 9110 §5.6.6 `parameters` list parser. New internal helper
   `parse_parameters(&str) -> Vec<(String, String)>` consumes a
   `parameters = *( OWS ";" OWS [ parameter ] )` tail and emits an
