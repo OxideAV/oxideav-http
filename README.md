@@ -158,6 +158,41 @@ cross-checks the GET-time `Content-Length` against §8.6's invariants:
   `Content-Length` (§8.6 makes it a SHOULD, not a MUST, outside
   specific cases).
 
+## Content-coding refusal (RFC 9110 §8.4 + §12.5.3)
+
+The driver's byte-offset model — the `Content-Length` recorded at
+HEAD, every `Content-Range` echo it validates, the §3.1 prefix
+drain — assumes the wire bytes ARE the representation bytes a
+demuxer consumes. §8.4 breaks that for coded representations: "the
+representation is defined in terms of the coded form, and all other
+metadata about the representation is about the coded form". And
+§12.5.3 rule 1 makes silence consent — a request with no
+`Accept-Encoding` declares every coding acceptable. So the driver
+acts on both sides:
+
+- The opening `HEAD` and every `Range` GET carry
+  `Accept-Encoding: identity`. Listing only the §12.5.3 "no
+  encoding" synonym makes every real coding "not listed" under
+  rule 3, steering a conformant server to send the un-coded bytes.
+- Any response that still carries a real `Content-Encoding` is
+  rejected before a byte reaches the reader — `Error::Unsupported`
+  at HEAD (with the coding names + §8.4 cite), fatal `io::Error` on
+  a 206 / 200-fallback GET. Every `Content-Encoding` field line is
+  walked (the §8.4 `#` list may span lines per §5.6.1), obs-fold is
+  normalised first (RFC 7230 §3.2.4), codings are lowercased
+  (§8.4.1 — case-insensitive), the redundant `identity` token is
+  tolerated as a no-op (§8.4 SHOULD NOT send it, but it codes
+  nothing), and empty list slots are dropped. Fail-direction is the
+  opposite of the §14.3 `Accept-Ranges` parser: a garbage
+  (non-token) slot is KEPT in the diagnostic, because a coding name
+  the driver cannot even parse is still a transformation it cannot
+  undo — skipping it would silently accept a coded body.
+
+The underlying client is built without its optional transparent
+decompression layer (see `Cargo.toml`), so the raw coded response —
+header evidence and all — reaches these checks instead of being
+inflated mid-stream behind the driver's back.
+
 ## Mid-stream mutation detection
 
 The driver implements RFC 9110 §13.1.5 `If-Range` to catch the case
@@ -399,6 +434,8 @@ plus the unified §5.6.7 dispatcher `parse_http_date`,
 `name=value` list with quoted-string-aware splitting),
 `parse_media_type` (RFC 9110 §8.3.1 `media-type = type "/" subtype
 parameters`),
+`non_identity_content_codings` (RFC 9110 §8.4 `Content-Encoding`
+list filter behind the content-coding refusal),
 and the composite
 `derive_strong_validator` (§13.1.5 + §8.8.2.2 + §8.8.3).
 The harness

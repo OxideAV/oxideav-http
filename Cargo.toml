@@ -22,4 +22,14 @@ fuzz = []
 [dependencies]
 oxideav-core = "0.1"
 oxideav-source = "0.1"
-ureq = "3"
+# default-features = false drops ureq's transparent gzip layer (its
+# default feature set is ["rustls", "gzip"]). The driver requires the
+# wire bytes to BE the representation bytes — it sends
+# `Accept-Encoding: identity` (RFC 9110 §12.5.3) and hard-rejects any
+# response that still carries a real `Content-Encoding` (§8.4:
+# representation metadata describes the coded form, so byte ranges over
+# a coded representation are useless to a demuxer). A client-side
+# auto-decompressor would consume the `Content-Encoding` evidence
+# before those checks run and redefine every byte count. `rustls` is
+# kept so https keeps working unchanged.
+ureq = { version = "3", default-features = false, features = ["rustls"] }

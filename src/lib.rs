@@ -392,8 +392,20 @@ impl HttpSource {
 
     fn open_impl(uri: &str, scoped: Option<Agent>) -> Result<Self> {
         let head_agent: &Agent = scoped.as_ref().unwrap_or_else(|| agent());
+        // RFC 9110 §12.5.3 rule 1: "If no Accept-Encoding header field
+        // is in the request, any content coding is considered
+        // acceptable by the user agent." The driver's whole byte-offset
+        // model (Content-Length recorded here, Content-Range echoes,
+        // the §3.1 prefix drain) assumes the wire bytes ARE the
+        // representation bytes a demuxer consumes, so any content
+        // coding is in fact unacceptable. `Accept-Encoding: identity`
+        // lists only the §12.5.3 "no encoding" synonym, making every
+        // real coding fall under rule 3's "not listed" and steering a
+        // conformant server to "send a response without any content
+        // coding".
         let head = head_agent
             .head(uri)
+            .header("Accept-Encoding", "identity")
             .call()
             .map_err(|e| Error::other(format!("HTTP HEAD {uri}: {e}")))?;
 
@@ -428,6 +440,38 @@ impl HttpSource {
             )));
         }
         let headers = head.headers();
+        // RFC 9110 §8.4: "the representation is defined in terms of the
+        // coded form, and all other metadata about the representation
+        // is about the coded form unless otherwise noted". So if a
+        // content coding is in effect, the Content-Length we are about
+        // to record — and every byte-range offset we will later request
+        // against it — describes the CODED bytes, not the media bytes a
+        // demuxer expects. The driver decodes no content codings, so a
+        // coded representation is unusable: refuse at open with the
+        // coding names rather than hand a demuxer compressed bytes (or
+        // a coded-length total) it would misparse downstream. The check
+        // walks every Content-Encoding field line (the §8.4 `#` list
+        // form may be split across lines per §5.6.1) and tolerates only
+        // the redundant `identity` token. Obs-fold is normalised before
+        // interpretation per RFC 7230 §3.2.4.
+        let mut head_codings: Vec<String> = Vec::new();
+        for v in headers.get_all("content-encoding") {
+            match v.to_str() {
+                Ok(s) => head_codings.extend(non_identity_content_codings(&normalize_obs_fold(s))),
+                // A field value we cannot even read as a string cannot
+                // name a coding we know how to leave alone — fail
+                // toward rejection, never toward silent acceptance.
+                Err(_) => head_codings.push("<non-ASCII content-coding>".to_owned()),
+            }
+        }
+        if !head_codings.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "HTTP HEAD {uri}: representation carries Content-Encoding {head_codings:?} \
+                 despite 'Accept-Encoding: identity' (RFC 9110 §12.5.3); per §8.4 the \
+                 Content-Length and byte ranges then describe the coded form, which the \
+                 driver does not decode"
+            )));
+        }
         let total_len = headers
             .get("content-length")
             .and_then(|v| v.to_str().ok())
@@ -535,7 +579,17 @@ impl HttpSource {
         // re-anchor the byte offset against a different representation.
         let if_range = self.validator.as_ref().map(|v| v.as_if_range().to_owned());
         let sent_if_range = if_range.is_some();
-        let mut req = self.agent_ref().get(&self.uri).header("Range", &range);
+        // RFC 9110 §12.5.3: list only `identity` so a conformant server
+        // never applies a content coding — the byte offsets in `Range`
+        // and the Content-Range echo must keep describing the same
+        // bytes the demuxer reads (§8.4: representation metadata is
+        // about the coded form). See the HEAD-side comment in
+        // `open_impl` for the full rationale.
+        let mut req = self
+            .agent_ref()
+            .get(&self.uri)
+            .header("Range", &range)
+            .header("Accept-Encoding", "identity");
         if let Some(ref v) = if_range {
             req = req.header("If-Range", v.as_str());
         }
@@ -583,6 +637,31 @@ impl HttpSource {
         if !(status == 206 || status == 200) {
             return Err(io::Error::other(format!(
                 "HTTP GET {} {}: status {status}",
+                self.uri, range
+            )));
+        }
+        // RFC 9110 §8.4 + §12.5.3: we sent `Accept-Encoding: identity`,
+        // so a response that nevertheless carries a real content coding
+        // means the server ignored the field. Every byte the reader is
+        // about to see — and the Content-Length / Content-Range
+        // metadata validated below — would describe the coded form
+        // (§8.4), so the read cannot proceed. Checked before any other
+        // metadata is interpreted: a §8.6 length-mismatch diagnostic on
+        // a gzip-coded body would name the symptom, not the cause.
+        // §5.6.1: the `#` list may be split across field lines, so walk
+        // them all; obs-fold normalised first per RFC 7230 §3.2.4.
+        let mut get_codings: Vec<String> = Vec::new();
+        for v in resp.headers().get_all("content-encoding") {
+            match v.to_str() {
+                Ok(s) => get_codings.extend(non_identity_content_codings(&normalize_obs_fold(s))),
+                Err(_) => get_codings.push("<non-ASCII content-coding>".to_owned()),
+            }
+        }
+        if !get_codings.is_empty() {
+            return Err(io::Error::other(format!(
+                "HTTP {status} {} {}: response carries Content-Encoding {get_codings:?} \
+                 despite 'Accept-Encoding: identity' (RFC 9110 §12.5.3) — per §8.4 the \
+                 body and byte-range metadata describe the coded form, not the media bytes",
                 self.uri, range
             )));
         }
@@ -963,6 +1042,46 @@ fn parse_accept_ranges(s: &str) -> AcceptRanges {
         return AcceptRanges::None;
     }
     AcceptRanges::Other(tokens)
+}
+
+/// Parse a `Content-Encoding` field value per RFC 9110 §8.4
+/// (`Content-Encoding = #content-coding`, `content-coding = token`)
+/// and return the codings that actually transform the bytes — i.e.
+/// every list element except the reserved `identity` token.
+///
+/// §8.4.1: "All content codings are case-insensitive", so each kept
+/// element is lowercased. §12.5.3 defines `identity` as "a synonym
+/// for 'no encoding'", and §8.4 says it "SHOULD NOT be included" in
+/// Content-Encoding — a server that sends it anyway is therefore
+/// tolerated as a no-op rather than rejected. §5.6.1 empty list
+/// elements (`gzip,,`) are dropped.
+///
+/// Fail-direction note: unlike `parse_accept_ranges`, a non-`token`
+/// list element is KEPT (trimmed + lowercased), not skipped. There,
+/// skipping a garbage slot protects the legitimate `bytes` next to it
+/// from being black-holed; here, skipping a garbage slot would
+/// silently ACCEPT a response whose body was transformed by a coding
+/// whose name we could not even parse — an unparseable coding is
+/// still a coding the driver cannot undo, so it must surface in the
+/// rejection diagnostic instead of vanishing.
+///
+/// An empty return means the representation is un-coded (or only
+/// redundantly `identity`-coded) and the byte-offset model holds.
+fn non_identity_content_codings(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let tok = part.trim_matches(|c: char| c == ' ' || c == '\t');
+        if tok.is_empty() {
+            // §5.6.1: empty list elements are tolerated and dropped.
+            continue;
+        }
+        let lower = tok.to_ascii_lowercase();
+        if lower == "identity" {
+            continue;
+        }
+        out.push(lower);
+    }
+    out
 }
 
 /// RFC 9110 §5.6.2 token grammar:
@@ -2142,6 +2261,10 @@ pub mod __fuzz {
     /// is a syntactically valid media-type, `None` otherwise — both
     /// outcomes must be reachable without a panic, and any returned
     /// `(type, subtype, params)` strings must be valid UTF-8.
+    pub fn non_identity_content_codings(s: &str) -> usize {
+        super::non_identity_content_codings(s).len()
+    }
+
     pub fn parse_media_type(s: &str) -> Option<usize> {
         super::parse_media_type(s).map(|(_, _, p)| p.len())
     }
@@ -3536,6 +3659,244 @@ mod tests {
         assert!(!is_token("foo,bar"));
         assert!(!is_token("foo/bar"));
         assert!(!is_token("\"quoted\""));
+    }
+
+    // -- Content-Encoding (RFC 9110 §8.4 / §12.5.3) --------------------------
+
+    #[test]
+    fn content_codings_empty_and_absent_are_acceptable() {
+        // No header value (or one that is all empty §5.6.1 list slots)
+        // means no coding — the byte-offset model holds.
+        assert!(non_identity_content_codings("").is_empty());
+        assert!(non_identity_content_codings("   ").is_empty());
+        assert!(non_identity_content_codings(",,,").is_empty());
+    }
+
+    #[test]
+    fn content_codings_identity_is_tolerated_as_no_op() {
+        // §12.5.3: identity is "a synonym for 'no encoding'". §8.4 says
+        // it SHOULD NOT appear in Content-Encoding, but a server that
+        // sends it anyway has not coded anything — tolerate, don't
+        // reject.
+        assert!(non_identity_content_codings("identity").is_empty());
+        assert!(non_identity_content_codings("Identity").is_empty());
+        assert!(non_identity_content_codings("identity, identity").is_empty());
+    }
+
+    #[test]
+    fn content_codings_real_codings_are_reported_lowercased() {
+        // §8.4.1: "All content codings are case-insensitive."
+        assert_eq!(non_identity_content_codings("gzip"), ["gzip"]);
+        assert_eq!(non_identity_content_codings("GZIP"), ["gzip"]);
+        // §8.4.1.3 names x-gzip as a SHOULD-equivalent of gzip; the
+        // driver decodes neither, so it is simply reported under its
+        // own (lowercased) name.
+        assert_eq!(non_identity_content_codings("x-gzip"), ["x-gzip"]);
+        assert_eq!(non_identity_content_codings("compress"), ["compress"]);
+        assert_eq!(non_identity_content_codings("deflate"), ["deflate"]);
+    }
+
+    #[test]
+    fn content_codings_list_preserves_application_order() {
+        // §8.4: the sender MUST list codings "in the order in which
+        // they were applied" — preserve that order in the diagnostic.
+        assert_eq!(
+            non_identity_content_codings("gzip, deflate"),
+            ["gzip", "deflate"]
+        );
+        // identity slots vanish; the real codings keep their order.
+        assert_eq!(
+            non_identity_content_codings("identity, gzip , identity, compress"),
+            ["gzip", "compress"]
+        );
+        // §5.6.1 empty slots are dropped without eating neighbours.
+        assert_eq!(non_identity_content_codings(",gzip,,"), ["gzip"]);
+    }
+
+    #[test]
+    fn content_codings_non_token_garbage_is_kept_not_skipped() {
+        // Opposite fail-direction from parse_accept_ranges: a coding
+        // name we cannot even parse is still a transformation we
+        // cannot undo, so it must surface in the rejection diagnostic
+        // rather than be silently skipped (which would ACCEPT the
+        // coded body).
+        assert_eq!(non_identity_content_codings("gzip stream"), ["gzip stream"]);
+        assert_eq!(non_identity_content_codings("identity, ???"), ["???"]);
+    }
+
+    #[test]
+    fn local_server_head_with_content_encoding_gzip_is_unsupported() {
+        // §8.4: representation metadata describes the coded form, so a
+        // coded representation's Content-Length (and any byte range
+        // against it) counts compressed bytes the demuxer cannot use.
+        // The driver must refuse at open, naming the coding + cite.
+        const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 10\r\n\
+            Accept-Ranges: bytes\r\n\
+            Content-Encoding: gzip\r\n\
+            Connection: close\r\n\
+            \r\n";
+        const GET: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD, GET);
+        let err = match HttpSource::open(&uri) {
+            Ok(_) => panic!("open must refuse a content-coded representation"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("gzip"), "missing coding name: {msg}");
+        assert!(msg.contains("8.4"), "missing §8.4 cite: {msg}");
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "expected Unsupported, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn local_server_head_with_content_encoding_identity_is_accepted() {
+        // §12.5.3 identity = "no encoding"; §8.4 SHOULD NOT send it,
+        // but tolerating it costs nothing and the bytes are un-coded.
+        const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 10\r\n\
+            Accept-Ranges: bytes\r\n\
+            Content-Encoding: identity\r\n\
+            Connection: close\r\n\
+            \r\n";
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 10\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD, GET);
+        let mut src = HttpSource::open(&uri).expect("identity coding must be tolerated");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+    }
+
+    #[test]
+    fn local_server_206_with_content_encoding_gzip_is_rejected() {
+        // The HEAD was clean but the GET came back coded — the server
+        // ignored our `Accept-Encoding: identity`. The reader must
+        // never see the coded bytes.
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 10\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Content-Encoding: gzip\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        let err = std::io::Read::read_exact(&mut src, &mut buf).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Content-Encoding"), "wrong error: {msg}");
+        assert!(msg.contains("gzip"), "missing coding name: {msg}");
+    }
+
+    #[test]
+    fn local_server_200_fallback_with_content_encoding_gzip_is_rejected() {
+        // Same offence on the RFC 7233 §3.1 full-body fallback: the
+        // §3.1 prefix drain counts representation bytes, which a
+        // coding would silently redefine.
+        static GET: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 10\r\n\
+            Content-Encoding: gzip\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _done) = spawn_server(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        let err = std::io::Read::read_exact(&mut src, &mut buf).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Content-Encoding"), "wrong error: {msg}");
+    }
+
+    #[test]
+    fn local_server_get_request_carries_accept_encoding_identity() {
+        // §12.5.3: the request side of the contract — every range GET
+        // must list only `identity` so a conformant server never
+        // applies a coding in the first place.
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 10\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, captured) = spawn_server_capturing_get(HEAD_10B_BYTES, GET);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        let req = captured.recv().expect("captured GET request");
+        let s = String::from_utf8_lossy(&req).to_ascii_lowercase();
+        assert!(
+            s.contains("accept-encoding: identity"),
+            "GET did not carry Accept-Encoding: identity; got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn local_server_head_request_carries_accept_encoding_identity() {
+        // Same contract on the opening HEAD: the Content-Length we
+        // record must be negotiated over the un-coded representation.
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 10\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, captured) = spawn_server_capturing_all(HEAD_10B_BYTES, GET);
+        let _src = HttpSource::open(&uri).expect("open");
+        let req = captured.recv().expect("captured HEAD request");
+        let s = String::from_utf8_lossy(&req).to_ascii_lowercase();
+        assert!(
+            s.starts_with("head "),
+            "first captured request not HEAD:\n{s}"
+        );
+        assert!(
+            s.contains("accept-encoding: identity"),
+            "HEAD did not carry Accept-Encoding: identity; got:\n{s}"
+        );
+    }
+
+    /// Variant of `spawn_server` that captures EVERY request's bytes
+    /// (HEAD and GET alike) so a test can inspect the opening HEAD.
+    fn spawn_server_capturing_all(
+        head_resp: &'static [u8],
+        get_resp: &'static [u8],
+    ) -> (String, mpsc::Receiver<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                use std::io::Read as _;
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let req = &buf[..n];
+                let _ = tx.send(req.to_vec());
+                let resp = if req.starts_with(b"HEAD ") {
+                    head_resp
+                } else {
+                    get_resp
+                };
+                let _ = stream.write_all(resp);
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}/x"), rx)
     }
 
     #[test]

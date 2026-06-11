@@ -52,6 +52,11 @@
 //! * `parse_media_type` — RFC 9110 §8.3.1 `media-type = type "/"
 //!   subtype parameters`. Contract: never panics; when `Some`, the
 //!   type/subtype tokens and every parameter pair are valid UTF-8.
+//! * `non_identity_content_codings` — RFC 9110 §8.4 `Content-Encoding
+//!   = #content-coding` list filter that drops `identity` (§12.5.3
+//!   "no encoding" synonym) and keeps everything else for the
+//!   coded-representation rejection diagnostic. Contract: never
+//!   panics on arbitrary input.
 //! * `derive_strong_validator` — §13.1.5 + §8.8.2.2 + §8.8.3
 //!   composite that picks an If-Range value from a HEAD's three
 //!   relevant headers.
@@ -77,6 +82,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = __fuzz::unquote_string(s);
         let _ = __fuzz::parse_parameters(s);
         let _ = __fuzz::parse_media_type(s);
+        let _ = __fuzz::non_identity_content_codings(s);
     }
 
     // Pass 2: NUL-split the input into up to three fields for the

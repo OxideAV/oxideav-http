@@ -9,6 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- RFC 9110 §8.4 / §12.5.3 content-coding refusal. The driver's whole
+  byte-offset model — the `Content-Length` recorded at HEAD, every
+  `Content-Range` echo it validates, the RFC 7233 §3.1 prefix drain —
+  assumes the wire bytes ARE the representation bytes a demuxer
+  consumes. But §12.5.3 rule 1 says "If no Accept-Encoding header
+  field is in the request, any content coding is considered acceptable
+  by the user agent", and §8.4 says a coded representation "is defined
+  in terms of the coded form, and all other metadata about the
+  representation is about the coded form" — so a server that elected
+  to gzip the response would silently turn every offset and length the
+  driver tracks into coded-byte quantities. Two-sided fix:
+  - Request side: the opening `HEAD` and every `Range` GET now carry
+    `Accept-Encoding: identity` — listing only the §12.5.3 "no
+    encoding" synonym makes every real coding fall under rule 3's
+    "not listed", steering a conformant server to "send a response
+    without any content coding".
+  - Response side (defence in depth — §12.5.3 is advisory): any
+    response that still carries a real `Content-Encoding` is rejected
+    before a single byte reaches the reader. At HEAD that is an
+    `Error::Unsupported` naming the coding(s) plus the §8.4 cite; on a
+    206 / 200-fallback GET it is a fatal `io::Error`. The check walks
+    every `Content-Encoding` field line (the §8.4 `#` list may be
+    split across lines per §5.6.1), normalises obs-fold first (RFC
+    7230 §3.2.4), lowercases each coding (§8.4.1 "All content codings
+    are case-insensitive"), tolerates the redundant `identity` token
+    (§8.4 SHOULD NOT send it, but it codes nothing), and drops empty
+    §5.6.1 list slots. Fail-direction is the opposite of the §14.3
+    `Accept-Ranges` parser: a non-`token` garbage slot is KEPT in the
+    diagnostic rather than skipped, because an unparseable coding name
+    is still a transformation the driver cannot undo — skipping it
+    would silently accept a coded body.
+  New internal helper `non_identity_content_codings` implements the
+  list filter; re-exported through the `#[doc(hidden)] pub mod __fuzz`
+  gate and exercised by the cargo-fuzz `parse_headers` harness with
+  three new seed-corpus entries. 11 new tests: 5 unit tests on the
+  filter (empty/absent, identity tolerance, §8.4.1 case-folding,
+  §8.4 application-order preservation, garbage-slot keeping) and 6
+  local-loopback server tests (HEAD-with-gzip refused with §8.4 cite,
+  HEAD-with-identity accepted, 206-with-gzip fatal, 200-fallback-with-
+  gzip fatal, and request-capture proofs that both HEAD and GET carry
+  `Accept-Encoding: identity` on the wire).
+
+### Changed
+
+- `ureq` dependency now pulled with `default-features = false,
+  features = ["rustls"]`. The dropped default `gzip` feature installed
+  a transparent client-side decompression layer that consumed the
+  `Content-Encoding` evidence (and the coded `Content-Length`) before
+  the driver's §8.4 checks could see them, attempting to inflate the
+  body mid-stream and redefining every byte count behind the driver's
+  back. With the layer gone the driver sees the raw coded response and
+  owns the refusal with a precise RFC-cited diagnostic. https support
+  is unchanged (`rustls` retained); the crate's dependency tree also
+  sheds the transitive decompressor crates.
+
 - RFC 9110 §8.3.1 `media-type` parser. New internal helper
   `parse_media_type(&str) -> Option<(String, String, Vec<(String,
   String)>)>` composes the §5.6.2 `is_token` and §5.6.6
