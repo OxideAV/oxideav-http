@@ -36,6 +36,9 @@
 //! * `parse_accept_ranges` — RFC 9110 §14.3 `acceptable-ranges =
 //!   1#range-unit` list-form classifier (Bytes / None / Other /
 //!   Absent).
+//! * `parse_vary` — RFC 9110 §12.5.5 `Vary = #( "*" / field-name )`
+//!   list-form classifier (Absent / Wildcard / Fields) gating the
+//!   content-negotiation stability check at open.
 //! * `is_multipart_byteranges_content_type` — RFC 9110 §8.3
 //!   media-type / §14.6 / §15.3.7.2 single-range MUST-NOT detector.
 //! * `format_retry_after_hint` — RFC 9110 §10.2.3 surfacing helper
@@ -76,6 +79,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = __fuzz::parse_http_date(s);
         let _ = __fuzz::parse_retry_after(s);
         let _ = __fuzz::parse_accept_ranges(s);
+        let _ = __fuzz::parse_vary(s);
         let _ = __fuzz::is_multipart_byteranges_content_type(s);
         let _ = __fuzz::format_retry_after_hint(s);
         let _ = __fuzz::normalize_obs_fold(s);

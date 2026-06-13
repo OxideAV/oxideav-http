@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- RFC 9110 §12.5.5 content-negotiation stability check. The driver
+  opens with a single `HEAD`, records length + validator, then ranges
+  over the resource with independent `Range` GETs — assuming the
+  target URI maps to one representation for the source's lifetime. A
+  `Vary` header is the origin's §12 proactive-negotiation warning that
+  a later request might be served a different representation. New
+  `parse_vary` classifies the §12.5.5 `Vary = #( "*" / field-name )`
+  list into Absent / Wildcard / Fields. A `Vary: *` response — whose
+  selection §12.5.5 says may depend on "aspects outside the message
+  syntax (e.g., the client's network address)" the driver cannot
+  reproduce across requests — is refused at open (`Error::Unsupported`)
+  **only when no strong validator was captured**; with one, a
+  representation swap re-surfaces as the §13.1.5 `If-Range`
+  200-fallback the GET path already treats as a fatal mid-stream
+  mutation. The field-name-list form (form 2) is accepted: the driver
+  sends a fixed, identical request header set on the `HEAD` and every
+  `Range` GET, so negotiation keyed on those fields is stable.
+  Field-names match case-insensitively (§5.1); a `*` member anywhere
+  poisons the value to the wildcard form; obs-fold is normalised per
+  §3.2.4 first. Six unit tests + a fuzz wrapper (`__fuzz::parse_vary`).
 - RFC 9110 §8.4 / §12.5.3 content-coding refusal. The driver's whole
   byte-offset model — the `Content-Length` recorded at HEAD, every
   `Content-Range` echo it validates, the RFC 7233 §3.1 prefix drain —

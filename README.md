@@ -226,6 +226,40 @@ never silently re-anchors against a different resource. When no
 `If-Range` was sent (no strong validator at HEAD), the §3.1
 prefix-drain fallback still applies unchanged.
 
+## Content-negotiation stability (RFC 9110 §12.5.5)
+
+The driver opens a resource with a single `HEAD`, records its length
+and validator, then satisfies every read with an independent `Range`
+GET — so it assumes the target URI maps to one representation that
+stays put for the source's lifetime. A `Vary` header on the `HEAD`
+response is the origin's warning that the response was subject to
+proactive content negotiation (§12) and a *different* representation
+might be served on a later request.
+
+The driver classifies `Vary` per its §12.5.5 ABNF
+(`Vary = #( "*" / field-name )`):
+
+- **`Vary: *`** — §12.5.5 says other aspects of the request, "possibly
+  including aspects outside the message syntax (e.g., the client's
+  network address)", might have selected this representation. The
+  driver cannot reproduce such out-of-band aspects across its `HEAD`
+  and later `Range` GETs. This is fatal **only when no strong
+  validator was captured**: with one in hand, a representation swap
+  re-materialises as the §13.1.5 `If-Range` 200-fallback the GET path
+  already treats as a fatal mid-stream mutation. Without one, the open
+  is refused (`Error::Unsupported`) rather than ranging blindly over a
+  resource that may change underfoot undetected.
+- **A list of field-names** (§12.5.5 form 2) — always safe here. The
+  driver sends a fixed, identical request header set on the `HEAD` and
+  on every `Range` GET (`Accept-Encoding: identity`, no
+  `Accept-Language`/`Accept` overrides), so negotiation keyed purely on
+  request fields lands on the same representation each time.
+- **Absent / empty** — no warning, no refusal.
+
+Field-names are matched case-insensitively (§5.1) and a member of `*`
+anywhere in the list poisons the whole value to the wildcard form. The
+value is run through the §3.2.4 obs-fold normaliser before parsing.
+
 ## Retry-After parsing (RFC 9110 §10.2.3)
 
 The free function `parse_retry_after` consumes a `Retry-After`

@@ -544,6 +544,48 @@ impl HttpSource {
             .and_then(|v| v.to_str().ok())
             .map(str::trim);
         let validator = derive_strong_validator(etag_raw, last_modified, date_hdr);
+        // RFC 9110 §12.5.5: a `Vary` header reports the request fields
+        // the origin used to select this representation via proactive
+        // content negotiation (§12). The driver issues a HEAD, records
+        // `total_len`/`validator`, then satisfies reads with separate
+        // Range GETs — so it must know the representation it ranges over
+        // is the one the HEAD measured. The wildcard form is the unsafe
+        // case: §12.5.5 says it "signals that other aspects of the
+        // request might have played a role in selecting the response
+        // representation, possibly including aspects outside the message
+        // syntax (e.g., the client's network address)". The driver
+        // cannot reproduce such out-of-band aspects across requests, so
+        // a `Vary: *` resource may serve a *different* representation on
+        // the very next Range GET — with a different length the recorded
+        // `total_len` no longer describes, and different bytes a demuxer
+        // would silently misparse. The `If-Range` path (§13.1.5) catches
+        // exactly this kind of mid-stream divergence, but only when a
+        // strong validator exists to carry. So `Vary: *` is fatal *only*
+        // when no strong validator was captured; with one in hand, a
+        // representation swap re-materialises as the §13.1.5 200-fallback
+        // we already treat as a fatal mid-stream mutation in the GET
+        // path. The concrete-field-name form (§12.5.5 form 2) is always
+        // safe here: the driver sends a fixed, identical request header
+        // set on the HEAD and every Range GET, so negotiation that keys
+        // only on request fields lands on the same representation each
+        // time. Obs-fold is normalised before interpretation per RFC
+        // 7230 §3.2.4 (`Vary` is a §5.6.1 comma list, a plausible
+        // obs-fold target for older origins/proxies).
+        let vary_owned = headers
+            .get("vary")
+            .and_then(|v| v.to_str().ok())
+            .map(normalize_obs_fold);
+        if let Some(vary_raw) = vary_owned.as_deref() {
+            if parse_vary(vary_raw) == Vary::Wildcard && validator.is_none() {
+                return Err(Error::Unsupported(format!(
+                    "HTTP HEAD {uri}: response carries 'Vary: *' (RFC 9110 §12.5.5) with no \
+                     strong validator (ETag / promotable Last-Modified) — the origin warns the \
+                     representation may be selected on aspects outside the message syntax, so a \
+                     later Range GET could serve a different representation the driver cannot \
+                     detect (no If-Range guard per §13.1.5)"
+                )));
+            }
+        }
         Ok(Self {
             uri: uri.to_owned(),
             total_len,
@@ -1042,6 +1084,84 @@ fn parse_accept_ranges(s: &str) -> AcceptRanges {
         return AcceptRanges::None;
     }
     AcceptRanges::Other(tokens)
+}
+
+/// Classification of a HEAD response's `Vary` header for the driver's
+/// content-negotiation stability check, per RFC 9110 §12.5.5.
+///
+/// The driver opens a resource with a single HEAD, records its length
+/// and validator, then satisfies every later read with an independent
+/// `Range` GET. That pattern silently assumes the origin maps the
+/// target URI to *one* representation that stays put for the lifetime
+/// of the source. `Vary` is exactly the signal that this assumption
+/// can be false:
+///
+/// > To inform user agent recipients that this response was subject to
+/// > content negotiation (§12) and a different representation might be
+/// > sent in a subsequent request if other values are provided in the
+/// > listed header fields (proactive negotiation). — §12.5.5
+///
+/// §12.5.5 ABNF: `Vary = #( "*" / field-name )` — a §5.6.1 list whose
+/// members are either the wildcard `*` or request field-names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Vary {
+    /// The field was absent or listed only empty members. §12.5.5 does
+    /// not require the field even on a negotiated resource, so this is
+    /// "no warning", not "no negotiation".
+    Absent,
+    /// A list containing `*`. §12.5.5: this "signals that other aspects
+    /// of the request might have played a role in selecting the response
+    /// representation, possibly including aspects outside the message
+    /// syntax (e.g., the client's network address)". The driver cannot
+    /// reproduce such aspects deterministically across its HEAD and the
+    /// later Range GETs, so the representation it ranges over is not
+    /// guaranteed to be the one the HEAD measured.
+    Wildcard,
+    /// A list of concrete request field-names (the selecting header
+    /// fields). The driver sends a fixed, identical header set on the
+    /// HEAD and on every Range GET (`Accept-Encoding: identity`, no
+    /// `Accept-Language`/`Accept` overrides, etc.), so as long as the
+    /// origin negotiates purely on those request fields the selected
+    /// representation is stable across the source's lifetime. Carries
+    /// the lowercased field-names for diagnostics.
+    Fields(Vec<String>),
+}
+
+/// Parse a `Vary` field value per RFC 9110 §12.5.5 ABNF
+/// (`Vary = #( "*" / field-name )`).
+///
+/// `#` is the §5.6.1 list construction: comma-separated, OWS-tolerant
+/// on each side of the comma, empty members dropped. A member of `*`
+/// anywhere in the list makes the whole value a [`Vary::Wildcard`] —
+/// §12.5.5 treats `*` as a list member, not a standalone form, and one
+/// `*` poisons the determinism of every read regardless of the other
+/// members. Otherwise each member is a `field-name` (a §5.6.2 token);
+/// non-token members are dropped (a single malformed slot must not mask
+/// a real selecting field next to it, mirroring `parse_accept_ranges`).
+/// Field-names are case-insensitive (§5.1), so they are lowercased.
+fn parse_vary(s: &str) -> Vary {
+    let mut fields: Vec<String> = Vec::new();
+    for part in s.split(',') {
+        let tok = part.trim_matches(|c: char| c == ' ' || c == '\t');
+        if tok.is_empty() {
+            continue;
+        }
+        if tok == "*" {
+            // §12.5.5: a list containing the member "*" — once seen, the
+            // whole value is the wildcard form. Short-circuit so a later
+            // garbage member can't downgrade it.
+            return Vary::Wildcard;
+        }
+        if !is_token(tok) {
+            continue;
+        }
+        fields.push(tok.to_ascii_lowercase());
+    }
+    if fields.is_empty() {
+        Vary::Absent
+    } else {
+        Vary::Fields(fields)
+    }
 }
 
 /// Parse a `Content-Encoding` field value per RFC 9110 §8.4
@@ -2215,6 +2335,17 @@ pub mod __fuzz {
             super::AcceptRanges::None => 1,
             super::AcceptRanges::Other(_) => 2,
             super::AcceptRanges::Absent => 3,
+        }
+    }
+    /// Fuzz-only wrapper for [`super::parse_vary`] (RFC 9110 §12.5.5
+    /// `Vary = #( "*" / field-name )`). Returns a small integer tag
+    /// (0=Absent, 1=Wildcard, 2=Fields) so the fuzzer can drive every
+    /// classification branch.
+    pub fn parse_vary(s: &str) -> u8 {
+        match super::parse_vary(s) {
+            super::Vary::Absent => 0,
+            super::Vary::Wildcard => 1,
+            super::Vary::Fields(_) => 2,
         }
     }
     /// Fuzz-only wrapper for
@@ -3659,6 +3790,75 @@ mod tests {
         assert!(!is_token("foo,bar"));
         assert!(!is_token("foo/bar"));
         assert!(!is_token("\"quoted\""));
+    }
+
+    // -- RFC 9110 §12.5.5 Vary parser ----------------------------------------
+
+    #[test]
+    fn vary_absent_on_empty_or_whitespace() {
+        // No usable members → Absent (no negotiation warning).
+        assert_eq!(parse_vary(""), Vary::Absent);
+        assert_eq!(parse_vary("   "), Vary::Absent);
+        // §5.6.1 empty list members are dropped; all-empty → Absent.
+        assert_eq!(parse_vary(",,,"), Vary::Absent);
+        assert_eq!(parse_vary(" , , "), Vary::Absent);
+    }
+
+    #[test]
+    fn vary_wildcard_bare_and_in_list() {
+        // §12.5.5: "A list containing the member '*' signals that other
+        // aspects of the request might have played a role..." — bare or
+        // mixed, the value is the wildcard form.
+        assert_eq!(parse_vary("*"), Vary::Wildcard);
+        assert_eq!(parse_vary("Accept-Encoding, *"), Vary::Wildcard);
+        assert_eq!(parse_vary("*, Accept-Language"), Vary::Wildcard);
+        // OWS around the wildcard member is tolerated per §5.6.1.
+        assert_eq!(parse_vary("  *  "), Vary::Wildcard);
+    }
+
+    #[test]
+    fn vary_wildcard_short_circuits_past_garbage() {
+        // Once `*` is seen, a later malformed member cannot downgrade
+        // the classification away from the unsafe wildcard form.
+        assert_eq!(parse_vary("*, foo bar"), Vary::Wildcard);
+    }
+
+    #[test]
+    fn vary_field_names_are_lowercased_and_listed() {
+        // §12.5.5 form 2: a list of selecting request field-names.
+        // §5.1 field-names are case-insensitive → lowercased.
+        match parse_vary("Accept-Encoding, Accept-Language") {
+            Vary::Fields(v) => {
+                assert_eq!(v, vec!["accept-encoding", "accept-language"]);
+            }
+            other => panic!("expected Fields, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vary_non_token_members_are_skipped_not_fatal() {
+        // A malformed slot (space inside a would-be token) must not
+        // black-hole the legitimate field-name next to it — mirrors
+        // the §5.6.2-token discipline in parse_accept_ranges.
+        match parse_vary("accept-encoding, foo bar") {
+            Vary::Fields(v) => assert_eq!(v, vec!["accept-encoding"]),
+            other => panic!("expected Fields, got {other:?}"),
+        }
+        // A list of only garbage members falls through to Absent, not a
+        // panic and not a spurious wildcard.
+        assert_eq!(parse_vary("foo bar, baz qux"), Vary::Absent);
+    }
+
+    #[test]
+    fn vary_quoted_star_is_a_field_name_not_wildcard() {
+        // §12.5.5's wildcard member is the bare token `*`. A member that
+        // merely contains `*` as part of a longer token (e.g. `x-*`) is
+        // a (peculiar) field-name, not the wildcard form. `*` itself is
+        // a valid §5.6.2 tchar, so `x-*` parses as a Fields member.
+        match parse_vary("x-*") {
+            Vary::Fields(v) => assert_eq!(v, vec!["x-*"]),
+            other => panic!("expected Fields for x-*, got {other:?}"),
+        }
     }
 
     // -- Content-Encoding (RFC 9110 §8.4 / §12.5.3) --------------------------
