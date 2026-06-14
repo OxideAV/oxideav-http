@@ -450,6 +450,45 @@ clients strip folds at the framing layer, so the helper is a
 defence-in-depth guard that almost never has to act, but the
 invariant is now explicit in the code).
 
+## Cache-Control parse (RFC 9111 §5.2)
+
+`parse_cache_control` parses a `Cache-Control` field value into a
+typed `CacheControl` per §5.2:
+
+```text
+Cache-Control   = #cache-directive
+cache-directive = token [ "=" ( token / quoted-string ) ]
+```
+
+The `#`-list (RFC 9110 §5.6.1) is split on top-level commas with
+quoted-string awareness, so a comma inside a `"…"` argument — e.g.
+`no-cache="x-foo, x-bar"` — does not start a new directive; empty
+list elements are skipped and OWS (§5.6.3) is trimmed from each.
+§5.2 makes directive names "compared case-insensitively", so they
+are lowercased before dispatch, and "recipients ought to accept
+both [token and quoted-string] forms" for arguments, so a quoted
+`max-age="60"` is honoured on receipt even though §5.2.2.1 requires
+senders to emit the bare token.
+
+Recognized §5.2.1 / §5.2.2 directives populate typed fields:
+`max-age` / `s-maxage` / `min-fresh` / `max-stale` carry §1.2.2
+`delta-seconds` arguments saturated at `2147483648` (2^31) on
+overflow per the §1.2.2 MUST; a non-`1*DIGIT` argument leaves the
+slot absent (§4.2.1 "non-integer content" → stale). `max-stale`
+distinguishes the no-argument form (`Some(None)`, "accept a stale
+response of any age") from a valued bound. The qualified
+`#field-name` forms of `no-cache` (§5.2.2.4) and `private`
+(§5.2.2.7) split their quoted argument into lowercased field names
+distinct from the unqualified booleans. The boolean directives
+(`no-store`, `no-transform`, `only-if-cached`, `must-revalidate`,
+`must-understand`, `proxy-revalidate`, `public`) set their flags.
+Duplicate valued directives keep the first occurrence (§4.2.1), and
+unrecognized directives are preserved in `extensions` rather than
+dropped (§5.2.3 "ignore unrecognized" — preserved so a behavioural
+extension consumer can still inspect them). A malformed element
+(bad token name, OWS around `=`, unterminated quoted-string) is
+skipped, never a hard error.
+
 ## Fuzzing
 
 `fuzz/` carries a cargo-fuzz harness (`parse_headers`) that drives
@@ -470,6 +509,8 @@ plus the unified §5.6.7 dispatcher `parse_http_date`,
 parameters`),
 `non_identity_content_codings` (RFC 9110 §8.4 `Content-Encoding`
 list filter behind the content-coding refusal),
+`parse_cache_control` (RFC 9111 §5.2 `Cache-Control =
+#cache-directive`),
 and the composite
 `derive_strong_validator` (§13.1.5 + §8.8.2.2 + §8.8.3).
 The harness

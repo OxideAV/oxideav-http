@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- RFC 9111 §5.2 `Cache-Control` directive parser. New
+  `parse_cache_control` reads a `Cache-Control = #cache-directive`
+  value into a typed `CacheControl` struct. The §5.6.1 `#`-list is
+  split on top-level commas with quoted-string awareness (a comma
+  inside a `no-cache="x-foo, x-bar"` argument does not start a new
+  directive); empty elements are skipped and OWS trimmed. Directive
+  names are lowercased (§5.2 "compared case-insensitively") and both
+  the token and quoted-string argument forms are accepted on receipt
+  (§5.2 "recipients ought to accept both forms"). `max-age` /
+  `s-maxage` / `min-fresh` / `max-stale` carry §1.2.2 `delta-seconds`
+  arguments saturated at `2147483648` (2^31) on overflow per the
+  §1.2.2 MUST (exposed as `DELTA_SECONDS_MAX`); a non-`1*DIGIT`
+  argument leaves the slot absent (§4.2.1 stale-on-non-integer).
+  `max-stale` distinguishes the no-argument "any age" form from a
+  valued bound. The qualified `#field-name` forms of `no-cache`
+  (§5.2.2.4) and `private` (§5.2.2.7) split into lowercased field
+  names distinct from the unqualified booleans; the boolean
+  directives (`no-store`, `no-transform`, `only-if-cached`,
+  `must-revalidate`, `must-understand`, `proxy-revalidate`, `public`)
+  set their flags. Duplicate valued directives keep the first
+  occurrence (§4.2.1) and unrecognized directives are preserved in
+  `extensions` (§5.2.3 "ignore unrecognized" — kept, not dropped).
+  Added to the `parse_headers` fuzz harness. 18 unit tests.
+
 - RFC 9110 §12.5.5 content-negotiation stability check. The driver
   opens with a single `HEAD`, records length + validator, then ranges
   over the resource with independent `Range` GETs — assuming the

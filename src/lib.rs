@@ -2272,6 +2272,313 @@ fn add_signed(base: u64, delta: i64) -> io::Result<u64> {
     }
 }
 
+/// The `delta-seconds` saturation value mandated by RFC 9111 §1.2.2.
+///
+/// §1.2.2: "If a cache receives a delta-seconds value greater than the
+/// greatest integer it can represent, or if any of its subsequent
+/// calculations overflows, the cache MUST consider the value to be
+/// 2147483648 (2^31) or the greatest positive integer it can
+/// conveniently represent." We store directive arguments in a `u64`
+/// (comfortably wider than the §1.2.2 "at least 31 bits" floor), so the
+/// only saturation path is an argument whose decimal digits overflow
+/// `u64`; those clamp to this constant rather than being dropped.
+pub const DELTA_SECONDS_MAX: u64 = 2_147_483_648;
+
+/// Parse a `delta-seconds` argument (RFC 9111 §1.2.2 `delta-seconds =
+/// 1*DIGIT`) with the §1.2.2 overflow-saturation rule applied.
+///
+/// Returns `Some(n)` for a non-empty all-ASCII-digit string, saturating
+/// any value that exceeds `u64::MAX` to [`DELTA_SECONDS_MAX`] per the
+/// §1.2.2 MUST. Returns `None` for the empty string or any non-digit
+/// byte (a leading `+`/`-`, embedded space, or a quoted-string form) —
+/// every directive that takes a `delta-seconds` argument is defined with
+/// the token form only (§5.2.2.1 / §5.2.1.x: "A sender MUST NOT generate
+/// the quoted-string form"), and §4.2.1 directs a recipient to treat a
+/// directive "with non-integer content" as making the response stale, so
+/// a non-numeric argument is reported as absent rather than silently
+/// coerced.
+fn parse_delta_seconds(arg: &str) -> Option<u64> {
+    if arg.is_empty() || !arg.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // §1.2.2: detect overflow and saturate rather than wrap; an
+    // out-of-range count must "not be treated as a negative value in
+    // later calculations".
+    Some(arg.parse::<u64>().unwrap_or(DELTA_SECONDS_MAX))
+}
+
+/// A parsed `Cache-Control` field value per RFC 9111 §5.2.
+///
+/// The §5.2 grammar `Cache-Control = #cache-directive` and
+/// `cache-directive = token [ "=" ( token / quoted-string ) ]` is a
+/// single production shared by request directives (§5.2.1) and response
+/// directives (§5.2.2); a recipient parses the wire form the same way in
+/// both roles and applies role-appropriate semantics afterwards, so this
+/// one struct carries every §5.2.1 / §5.2.2 directive. Fields are `None`
+/// / `false` / empty when the corresponding directive is absent.
+///
+/// §5.2.3: "A cache MUST ignore unrecognized cache directives." Any
+/// directive token not defined in §5.2.1 / §5.2.2 is preserved in
+/// [`extensions`](CacheControl::extensions) (so a behavioural-extension
+/// consumer can still inspect it) rather than discarded — ignoring is a
+/// behaviour, not a parse failure.
+///
+/// Duplicate-directive policy follows RFC 9111 §4.2.1: "When there is
+/// more than one value present for a given directive … either the first
+/// occurrence should be used or the response should be considered
+/// stale." This parser takes the first-occurrence option for every
+/// valued directive (later duplicates of `max-age`, `s-maxage`, etc. are
+/// dropped). A boolean directive appearing more than once is idempotent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CacheControl {
+    /// `max-age` (§5.2.1.1 request / §5.2.2.1 response) `delta-seconds`,
+    /// §1.2.2-saturated. `None` when absent or carrying a non-`1*DIGIT`
+    /// argument.
+    pub max_age: Option<u64>,
+    /// `s-maxage` (§5.2.2.10) `delta-seconds`, §1.2.2-saturated.
+    pub s_maxage: Option<u64>,
+    /// `max-stale` (§5.2.1.2). `Some(None)` is the no-argument form
+    /// ("accept a stale response of any age"); `Some(Some(n))` carries
+    /// the §1.2.2-saturated bound. `None` when the directive is absent.
+    pub max_stale: Option<Option<u64>>,
+    /// `min-fresh` (§5.2.1.3) `delta-seconds`, §1.2.2-saturated.
+    pub min_fresh: Option<u64>,
+    /// Unqualified `no-cache` — §5.2.1.4 (request) / the argument-free
+    /// §5.2.2.4 (response) form. `true` whenever a `no-cache` directive
+    /// is present without an argument.
+    pub no_cache: bool,
+    /// Qualified `no-cache="field1, field2"` field names (§5.2.2.4),
+    /// lowercased ("Field names are case-insensitive"). Empty unless the
+    /// quoted-string argument form is present.
+    pub no_cache_fields: Vec<String>,
+    /// `no-store` (§5.2.1.5 request / §5.2.2.5 response).
+    pub no_store: bool,
+    /// `no-transform` (§5.2.1.6 request / §5.2.2.6 response).
+    pub no_transform: bool,
+    /// `only-if-cached` (§5.2.1.7, request directive).
+    pub only_if_cached: bool,
+    /// `must-revalidate` (§5.2.2.2, response directive).
+    pub must_revalidate: bool,
+    /// `must-understand` (§5.2.2.3, response directive).
+    pub must_understand: bool,
+    /// Unqualified `private` (§5.2.2.7, response directive).
+    pub private: bool,
+    /// Qualified `private="field1, field2"` field names (§5.2.2.7),
+    /// lowercased. Empty unless the quoted-string argument form is
+    /// present.
+    pub private_fields: Vec<String>,
+    /// `proxy-revalidate` (§5.2.2.8, response directive).
+    pub proxy_revalidate: bool,
+    /// `public` (§5.2.2.9, response directive).
+    pub public: bool,
+    /// Unrecognized / extension directives (§5.2.3), preserved as
+    /// `(lowercased token, optional decoded argument)` in wire order.
+    pub extensions: Vec<(String, Option<String>)>,
+}
+
+/// Parse a `Cache-Control` field value per RFC 9111 §5.2.
+///
+/// ABNF (§5.2):
+///
+/// ```text
+/// Cache-Control   = #cache-directive
+/// cache-directive = token [ "=" ( token / quoted-string ) ]
+/// ```
+///
+/// The `#`-list (RFC 9110 §5.6.1) is split on top-level commas with
+/// quoted-string awareness (a comma inside a `"…"` argument does not end
+/// a directive), empty elements are skipped per §5.6.1's "tolerate empty
+/// list elements" recipient posture, and surrounding OWS (§5.6.3) is
+/// trimmed from each element. An `obs-fold` (RFC 7230 §3.2.4) anywhere
+/// in the value is normalised to a single SP before splitting.
+///
+/// §5.2: "Cache directives are identified by a token, to be compared
+/// case-insensitively" — directive names are lowercased before
+/// dispatch. "[Directives] have an optional argument that can use both
+/// token and quoted-string syntax. For the directives defined below that
+/// define arguments, recipients ought to accept both forms" — so the
+/// argument is read via the §5.6.4 quoted-string unwrap when it opens
+/// with DQUOTE, and as a bare token otherwise, regardless of which form
+/// §5.2 nominally requires the *sender* to use.
+///
+/// Recognized directives populate the typed [`CacheControl`] fields;
+/// `delta-seconds` arguments are validated and §1.2.2-saturated via
+/// [`parse_delta_seconds`] (a non-numeric argument leaves the field
+/// `None` — §4.2.1 stale-on-non-integer). The qualified `#field-name`
+/// forms of `no-cache` / `private` (§5.2.2.4 / §5.2.2.7) split their
+/// decoded quoted-string argument into lowercased field names. Unknown
+/// directive tokens land in [`CacheControl::extensions`] (§5.2.3 "ignore
+/// unrecognized" — preserved, not dropped). Duplicate valued directives
+/// keep the first occurrence (§4.2.1).
+///
+/// This is always a structural parse: a malformed element (a bad token
+/// name, OWS around the `=`, an unterminated quoted-string) is skipped,
+/// never a hard error, matching the recipient robustness the rest of the
+/// driver applies to §5.6.1 list fields.
+pub fn parse_cache_control(s: &str) -> CacheControl {
+    let normalized = normalize_obs_fold(s);
+    let mut cc = CacheControl::default();
+    for elem in split_directive_list(&normalized) {
+        // cache-directive = token [ "=" ( token / quoted-string ) ].
+        // Split on the FIRST `=`; a `=` inside the quoted-string body is
+        // protected because the qstr only appears on the value side.
+        let (raw_name, raw_arg) = match elem.split_once('=') {
+            Some((n, v)) => (n, Some(v)),
+            None => (elem, None),
+        };
+        // §5.6.3 OWS is not permitted around the `=` in a directive
+        // (cache-directive has no OWS between token and "="); but a
+        // recipient trimming the element edges is harmless and matches
+        // the parse_one_parameter posture. Trim element-edge OWS only.
+        let name = raw_name.trim_matches(|c: char| c == ' ' || c == '\t');
+        if !is_token(name) {
+            // Empty or non-token directive name — skip (e.g. a stray
+            // comma element, or `"=foo"`).
+            continue;
+        }
+        let lname = name.to_ascii_lowercase();
+        // Decode the argument: quoted-string (§5.6.4 unwrap) when it
+        // opens with DQUOTE, otherwise a bare token. A present-but-empty
+        // or malformed argument decodes to None for that element.
+        let arg: Option<String> = match raw_arg {
+            None => None,
+            Some(v) => {
+                let v = v.trim_matches(|c: char| c == ' ' || c == '\t');
+                if v.starts_with('"') {
+                    // §5.6.4 quoted-string form: unwrap and collapse any
+                    // quoted-pair. An unterminated qstr decodes to None.
+                    unquote_string(v).map(|c| c.into_owned())
+                } else if is_token(v) {
+                    Some(v.to_owned())
+                } else {
+                    // Empty or non-token bare argument — treat the
+                    // directive as argument-less for recognized booleans,
+                    // and as a no-argument extension otherwise.
+                    None
+                }
+            }
+        };
+        apply_directive(&mut cc, &lname, arg);
+    }
+    cc
+}
+
+/// Dispatch one parsed `(lowercased-name, optional-decoded-argument)`
+/// directive into the typed [`CacheControl`] accumulator per RFC 9111
+/// §5.2.1 / §5.2.2, honouring §4.2.1 first-occurrence-wins for valued
+/// directives and §5.2.3 extension preservation.
+fn apply_directive(cc: &mut CacheControl, name: &str, arg: Option<String>) {
+    // delta-seconds helper: first-occurrence-wins (§4.2.1) on the
+    // already-populated slot.
+    fn set_delta(slot: &mut Option<u64>, arg: &Option<String>) {
+        if slot.is_none() {
+            if let Some(a) = arg {
+                *slot = parse_delta_seconds(a);
+            }
+        }
+    }
+    // #field-name argument splitter for the qualified no-cache / private
+    // forms (§5.2.2.4 / §5.2.2.7): a comma list of field-names, each a
+    // token, lowercased ("Field names are case-insensitive").
+    fn field_names(arg: &str) -> Vec<String> {
+        arg.split(',')
+            .map(|f| f.trim_matches(|c: char| c == ' ' || c == '\t'))
+            .filter(|f| is_token(f))
+            .map(|f| f.to_ascii_lowercase())
+            .collect()
+    }
+    match name {
+        "max-age" => set_delta(&mut cc.max_age, &arg),
+        "s-maxage" => set_delta(&mut cc.s_maxage, &arg),
+        "min-fresh" => set_delta(&mut cc.min_fresh, &arg),
+        "max-stale" => {
+            // §5.2.1.2: "If no value is assigned to max-stale, then the
+            // client will accept a stale response of any age." Model
+            // no-arg as Some(None), valued as Some(Some(n)). First
+            // occurrence wins (§4.2.1).
+            if cc.max_stale.is_none() {
+                cc.max_stale = Some(arg.as_deref().and_then(parse_delta_seconds));
+            }
+        }
+        "no-cache" => {
+            // §5.2.2.4: unqualified (no arg) vs qualified (#field-name in
+            // a quoted-string). A present argument is the qualified form.
+            match arg {
+                Some(a) => {
+                    let names = field_names(&a);
+                    if cc.no_cache_fields.is_empty() {
+                        cc.no_cache_fields = names;
+                    }
+                }
+                None => cc.no_cache = true,
+            }
+        }
+        "private" => match arg {
+            Some(a) => {
+                let names = field_names(&a);
+                if cc.private_fields.is_empty() {
+                    cc.private_fields = names;
+                }
+            }
+            None => cc.private = true,
+        },
+        "no-store" => cc.no_store = true,
+        "no-transform" => cc.no_transform = true,
+        "only-if-cached" => cc.only_if_cached = true,
+        "must-revalidate" => cc.must_revalidate = true,
+        "must-understand" => cc.must_understand = true,
+        "proxy-revalidate" => cc.proxy_revalidate = true,
+        "public" => cc.public = true,
+        // §5.2.3: ignore unrecognized directives — preserved (not
+        // dropped) so behavioural-extension consumers can still see them.
+        _ => cc.extensions.push((name.to_owned(), arg)),
+    }
+}
+
+/// Split a `Cache-Control` (or any RFC 9110 §5.6.1 `#`-list whose
+/// elements may contain a quoted-string argument) value into trimmed,
+/// non-empty elements on top-level commas.
+///
+/// A comma inside a `"…"` quoted-string (with `\`-escaped octets
+/// honoured per §5.6.4 `quoted-pair`) does NOT split the list — this is
+/// what lets `no-cache="x-foo, x-bar"` survive as one directive. Empty
+/// elements (from `a,,b` or a leading/trailing comma) are dropped per
+/// §5.6.1, and each surviving element is OWS-trimmed (§5.6.3).
+fn split_directive_list(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut out: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    let mut in_quote = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_quote {
+            if b == b'\\' && i + 1 < bytes.len() {
+                // quoted-pair: skip the escaped octet so a `\"` or `\,`
+                // inside the body is not mistaken for a delimiter.
+                i += 2;
+                continue;
+            } else if b == b'"' {
+                in_quote = false;
+            }
+        } else if b == b'"' {
+            in_quote = true;
+        } else if b == b',' {
+            let elem = s[start..i].trim_matches(|c: char| c == ' ' || c == '\t');
+            if !elem.is_empty() {
+                out.push(elem);
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    let elem = s[start..].trim_matches(|c: char| c == ' ' || c == '\t');
+    if !elem.is_empty() {
+        out.push(elem);
+    }
+    out
+}
+
 /// Header-parser wrappers exposed for the cargo-fuzz harness under
 /// `fuzz/`. Not part of the stable public surface; gated behind the
 /// `fuzz` cargo feature so the published artefact carries the same
@@ -2398,6 +2705,38 @@ pub mod __fuzz {
 
     pub fn parse_media_type(s: &str) -> Option<usize> {
         super::parse_media_type(s).map(|(_, _, p)| p.len())
+    }
+    /// Fuzz-only wrapper for [`super::parse_cache_control`] — exercises
+    /// the RFC 9111 §5.2 `Cache-Control = #cache-directive` grammar
+    /// (quoted-string-aware comma splitting, token/quoted-string
+    /// arguments, §1.2.2 delta-seconds saturation, §5.2.3 extension
+    /// preservation) on arbitrary input. Returns the total count of
+    /// populated directive slots so the fuzzer can drive both the empty
+    /// and many-directive branches; the parser must never panic and any
+    /// returned strings must be valid UTF-8.
+    pub fn parse_cache_control(s: &str) -> usize {
+        let cc = super::parse_cache_control(s);
+        let mut n = cc.extensions.len()
+            + cc.no_cache_fields.len()
+            + cc.private_fields.len()
+            + usize::from(cc.max_age.is_some())
+            + usize::from(cc.s_maxage.is_some())
+            + usize::from(cc.max_stale.is_some())
+            + usize::from(cc.min_fresh.is_some());
+        for flag in [
+            cc.no_cache,
+            cc.no_store,
+            cc.no_transform,
+            cc.only_if_cached,
+            cc.must_revalidate,
+            cc.must_understand,
+            cc.private,
+            cc.proxy_revalidate,
+            cc.public,
+        ] {
+            n += usize::from(flag);
+        }
+        n
     }
 }
 
@@ -5319,5 +5658,188 @@ mod tests {
             "malformed Retry-After must surface raw + diagnostic: {msg}"
         );
         assert!(msg.contains("§10.2.3"), "missing §10.2.3 cite: {msg}");
+    }
+
+    // -- RFC 9111 §5.2 Cache-Control parser ----------------------------------
+
+    #[test]
+    fn cache_control_empty_value_yields_default() {
+        assert_eq!(parse_cache_control(""), CacheControl::default());
+        assert_eq!(parse_cache_control("   "), CacheControl::default());
+        // §5.6.1: empty list elements are skipped.
+        assert_eq!(parse_cache_control(",,"), CacheControl::default());
+    }
+
+    #[test]
+    fn cache_control_boolean_directives_set_flags() {
+        let cc = parse_cache_control(
+            "no-store, no-transform, only-if-cached, must-revalidate, \
+             must-understand, proxy-revalidate, public",
+        );
+        assert!(cc.no_store);
+        assert!(cc.no_transform);
+        assert!(cc.only_if_cached);
+        assert!(cc.must_revalidate);
+        assert!(cc.must_understand);
+        assert!(cc.proxy_revalidate);
+        assert!(cc.public);
+        // No valued / qualified slots were touched.
+        assert!(cc.max_age.is_none());
+        assert!(cc.no_cache_fields.is_empty());
+        assert!(cc.extensions.is_empty());
+    }
+
+    #[test]
+    fn cache_control_directive_names_are_case_insensitive() {
+        // §5.2: "identified by a token, to be compared case-insensitively".
+        let cc = parse_cache_control("No-Store, MAX-AGE=60, Public");
+        assert!(cc.no_store);
+        assert_eq!(cc.max_age, Some(60));
+        assert!(cc.public);
+    }
+
+    #[test]
+    fn cache_control_max_age_token_argument() {
+        // §5.2.2.1: token form `max-age=5`.
+        let cc = parse_cache_control("max-age=300");
+        assert_eq!(cc.max_age, Some(300));
+        assert_eq!(parse_cache_control("max-age=0").max_age, Some(0));
+    }
+
+    #[test]
+    fn cache_control_s_maxage_and_min_fresh() {
+        let cc = parse_cache_control("s-maxage=120, min-fresh=20");
+        assert_eq!(cc.s_maxage, Some(120));
+        assert_eq!(cc.min_fresh, Some(20));
+    }
+
+    #[test]
+    fn cache_control_delta_seconds_overflow_saturates() {
+        // §1.2.2: a delta-seconds that overflows MUST clamp to 2^31,
+        // never wrap or be treated as negative.
+        let huge = "max-age=99999999999999999999999999999";
+        assert_eq!(parse_cache_control(huge).max_age, Some(DELTA_SECONDS_MAX));
+    }
+
+    #[test]
+    fn cache_control_non_integer_delta_seconds_is_absent() {
+        // §4.2.1: a directive "with non-integer content" makes the
+        // response stale — we report the slot as absent rather than
+        // coercing a garbage argument.
+        assert!(parse_cache_control("max-age=abc").max_age.is_none());
+        assert!(parse_cache_control("max-age=-5").max_age.is_none());
+        assert!(parse_cache_control("max-age=").max_age.is_none());
+        assert!(parse_cache_control("max-age").max_age.is_none());
+    }
+
+    #[test]
+    fn cache_control_delta_seconds_accepts_quoted_argument_on_receipt() {
+        // §5.2: senders MUST use the token form, but "recipients ought to
+        // accept both forms".
+        assert_eq!(parse_cache_control("max-age=\"60\"").max_age, Some(60));
+    }
+
+    #[test]
+    fn cache_control_max_stale_no_arg_vs_valued() {
+        // §5.2.1.2: bare max-stale accepts a stale response of any age.
+        assert_eq!(parse_cache_control("max-stale").max_stale, Some(None));
+        assert_eq!(
+            parse_cache_control("max-stale=10").max_stale,
+            Some(Some(10))
+        );
+        assert_eq!(parse_cache_control("").max_stale, None);
+    }
+
+    #[test]
+    fn cache_control_no_cache_unqualified_vs_qualified() {
+        // §5.2.2.4: unqualified no-cache.
+        let bare = parse_cache_control("no-cache");
+        assert!(bare.no_cache);
+        assert!(bare.no_cache_fields.is_empty());
+        // Qualified form: quoted #field-name list, names lowercased.
+        let qual = parse_cache_control("no-cache=\"Set-Cookie, X-Foo\"");
+        assert!(!qual.no_cache);
+        assert_eq!(qual.no_cache_fields, vec!["set-cookie", "x-foo"]);
+    }
+
+    #[test]
+    fn cache_control_private_unqualified_vs_qualified() {
+        // §5.2.2.7.
+        assert!(parse_cache_control("private").private);
+        let qual = parse_cache_control("private=\"Authorization\"");
+        assert!(!qual.private);
+        assert_eq!(qual.private_fields, vec!["authorization"]);
+    }
+
+    #[test]
+    fn cache_control_quoted_comma_does_not_split_directive() {
+        // The comma inside the quoted #field-name argument must not end
+        // the no-cache directive and start a new one.
+        let cc = parse_cache_control("no-cache=\"a, b\", max-age=5");
+        assert_eq!(cc.no_cache_fields, vec!["a", "b"]);
+        assert_eq!(cc.max_age, Some(5));
+    }
+
+    #[test]
+    fn cache_control_unknown_directive_preserved_as_extension() {
+        // §5.2.3: ignore unrecognized directives — preserved here so an
+        // extension consumer can still inspect them.
+        let cc = parse_cache_control("immutable, community=\"UCI\", max-age=1");
+        assert_eq!(cc.max_age, Some(1));
+        assert_eq!(
+            cc.extensions,
+            vec![
+                ("immutable".to_owned(), None),
+                ("community".to_owned(), Some("UCI".to_owned())),
+            ]
+        );
+    }
+
+    #[test]
+    fn cache_control_duplicate_valued_directive_keeps_first() {
+        // §4.2.1: first occurrence is used for a repeated valued directive.
+        assert_eq!(
+            parse_cache_control("max-age=10, max-age=99").max_age,
+            Some(10)
+        );
+        assert_eq!(
+            parse_cache_control("max-stale=1, max-stale=2").max_stale,
+            Some(Some(1))
+        );
+    }
+
+    #[test]
+    fn cache_control_ows_around_elements_tolerated() {
+        // §5.6.3 OWS around each #-list element.
+        let cc = parse_cache_control("  no-store ,  max-age=7  ");
+        assert!(cc.no_store);
+        assert_eq!(cc.max_age, Some(7));
+    }
+
+    #[test]
+    fn cache_control_obs_fold_normalised_before_split() {
+        // RFC 7230 §3.2.4: an obs-fold becomes SP before list splitting.
+        let cc = parse_cache_control("max-age=30,\r\n no-cache");
+        assert_eq!(cc.max_age, Some(30));
+        assert!(cc.no_cache);
+    }
+
+    #[test]
+    fn cache_control_malformed_element_skipped_not_fatal() {
+        // A non-token name and a bare `=value` element are skipped; the
+        // surrounding good directives still parse.
+        let cc = parse_cache_control("no-store, =bad, ba()d=x, public");
+        assert!(cc.no_store);
+        assert!(cc.public);
+        assert!(cc.extensions.is_empty());
+    }
+
+    #[test]
+    fn parse_delta_seconds_boundary() {
+        assert_eq!(parse_delta_seconds("0"), Some(0));
+        assert_eq!(parse_delta_seconds("2147483648"), Some(DELTA_SECONDS_MAX));
+        assert_eq!(parse_delta_seconds(""), None);
+        assert_eq!(parse_delta_seconds("+1"), None);
+        assert_eq!(parse_delta_seconds("1 "), None);
     }
 }

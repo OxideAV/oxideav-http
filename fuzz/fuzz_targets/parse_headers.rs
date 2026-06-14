@@ -60,6 +60,11 @@
 //!   "no encoding" synonym) and keeps everything else for the
 //!   coded-representation rejection diagnostic. Contract: never
 //!   panics on arbitrary input.
+//! * `parse_cache_control` — RFC 9111 §5.2 `Cache-Control =
+//!   #cache-directive` parser (quoted-string-aware comma splitting,
+//!   token/quoted-string arguments, §1.2.2 delta-seconds saturation,
+//!   §5.2.3 extension preservation). Contract: never panics; every
+//!   returned string is valid UTF-8.
 //! * `derive_strong_validator` — §13.1.5 + §8.8.2.2 + §8.8.3
 //!   composite that picks an If-Range value from a HEAD's three
 //!   relevant headers.
@@ -87,6 +92,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = __fuzz::parse_parameters(s);
         let _ = __fuzz::parse_media_type(s);
         let _ = __fuzz::non_identity_content_codings(s);
+        let _ = __fuzz::parse_cache_control(s);
     }
 
     // Pass 2: NUL-split the input into up to three fields for the
