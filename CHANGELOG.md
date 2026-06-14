@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- RFC 9110 §11.6.1 `WWW-Authenticate` challenge-list parser. New
+  `parse_www_authenticate` reads a `WWW-Authenticate = #challenge`
+  value into a `Vec<Challenge>`, where `Challenge` carries the
+  lowercased `auth-scheme` (§11.1 case-insensitive token), an optional
+  `token68` (§11.2), and an ordered `(lowercased-name, decoded-value)`
+  `auth-param` list (§11.2). The parser resolves the §11.6.1 list
+  ambiguity — both the challenge list and each challenge's `auth-param`
+  list are comma-separated — by classifying each quoted-string-aware
+  top-level comma element as either a bare `auth-param`
+  (`token BWS "=" …`, attaching to the challenge in progress) or a
+  challenge head (`auth-scheme` alone or `auth-scheme 1*SP <arg>`,
+  starting a new challenge). The canonical §11.6.1 worked example
+  (`Basic realm="simple", Newauth realm="apps", type=1, title="Login
+  to \"apps\""` → two challenges) round-trips. §11.2 BWS around `=` is
+  tolerated (unlike the §5.6.6 `parameter` production), quoted-string
+  values are unwrapped via the §5.6.4 helper (case preserved — value
+  case-sensitivity is scheme-specific), and `token68` is discriminated
+  from a `name=value` `auth-param` (the ambiguity resolves toward
+  `auth-param`). §11.3 mutual exclusivity is enforced: a challenge that
+  committed to `token68` rejects trailing `auth-param`s. Malformed
+  pieces are skipped per §5.6.1 recipient robustness (the §11.6.1
+  "comma, whitespace, comma" empty-element note is honoured as
+  harmless). The same production backs `Proxy-Authenticate` (§11.7.1)
+  and single-`credentials` `Authorization` values. Exercised by 21
+  unit tests and wired into the cargo-fuzz `parse_headers` harness.
+
 - RFC 9111 §5.2 `Cache-Control` directive parser. New
   `parse_cache_control` reads a `Cache-Control = #cache-directive`
   value into a typed `CacheControl` struct. The §5.6.1 `#`-list is

@@ -1213,27 +1213,7 @@ fn non_identity_content_codings(s: &str) -> Vec<String> {
 ///        / DIGIT / ALPHA
 /// ```
 fn is_token(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(
-                    b,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        })
+    !s.is_empty() && s.bytes().all(is_tchar)
 }
 
 /// Normalize obsolete line folding (`obs-fold`) in a header field value
@@ -2579,6 +2559,322 @@ fn split_directive_list(s: &str) -> Vec<&str> {
     out
 }
 
+/// One parsed `challenge` from a `WWW-Authenticate` (or
+/// `Proxy-Authenticate`) field value, per RFC 9110 §11.3:
+///
+/// ```text
+/// challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+/// ```
+///
+/// A challenge is an authentication-scheme name optionally followed by
+/// EITHER a single `token68` blob (the base64-ish form used by schemes
+/// like Negotiate / NTLM) OR a comma-separated list of `auth-param`
+/// name/value pairs (the form used by Basic / Digest, e.g.
+/// `realm="…"`). The two argument shapes are mutually exclusive within
+/// one challenge, so [`token68`](Challenge::token68) and
+/// [`params`](Challenge::params) are never both populated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Challenge {
+    /// `auth-scheme` (§11.1) — "a case-insensitive token to identify the
+    /// authentication scheme", lowercased here so `Basic` / `basic`
+    /// compare equal.
+    pub scheme: String,
+    /// The `token68` form (§11.2) when the scheme carried a single
+    /// base64/base32/base16-style blob instead of `auth-param`s. `None`
+    /// when the challenge had no argument or carried `auth-param`s.
+    pub token68: Option<String>,
+    /// `auth-param` list (§11.2) as `(lowercased-name, decoded-value)`
+    /// pairs in wire order. Names are matched case-insensitively (§11.2);
+    /// values are read through the §5.6.4 quoted-string unwrap when
+    /// DQUOTE-wrapped and kept verbatim when in `token` form (value
+    /// case-sensitivity is scheme-specific, so the value case is not
+    /// folded). Empty when the challenge had no argument or carried a
+    /// `token68`.
+    pub params: Vec<(String, String)>,
+}
+
+/// Parse a `WWW-Authenticate` / `Proxy-Authenticate` field value into a
+/// list of [`Challenge`]s, per RFC 9110 §11.6.1:
+///
+/// ```text
+/// WWW-Authenticate = #challenge
+/// challenge        = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+/// auth-scheme      = token
+/// auth-param       = token BWS "=" BWS ( token / quoted-string )
+/// token68          = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~"
+///                        / "+" / "/" ) *"="
+/// ```
+///
+/// ## The §11.6.1 list ambiguity
+///
+/// Both the challenge list AND the `auth-param` list inside a challenge
+/// are comma-separated, so a flat top-level comma split cannot by itself
+/// tell "next challenge" from "next `auth-param` of the current
+/// challenge". §11.6.1 spells out the worked example:
+///
+/// ```text
+/// WWW-Authenticate: Basic realm="simple", Newauth realm="apps",
+///                   type=1, title="Login to \"apps\""
+/// ```
+///
+/// which is **two** challenges: `Basic` with `realm="simple"`, and
+/// `Newauth` with `realm="apps", type=1, title="Login to \"apps\""`.
+///
+/// The disambiguation rule this parser applies, after a quoted-string-
+/// aware top-level comma split (§5.6.1 `#`-list, so a comma inside a
+/// `"…"` value never splits): each list element is classified as either
+///
+/// - a **bare `auth-param`** (`token BWS "=" …`) — it has NO scheme of
+///   its own, so it attaches to the challenge currently being built; or
+/// - a **challenge head** (`auth-scheme` alone, or `auth-scheme 1*SP
+///   <arg>`) — it starts a new challenge.
+///
+/// An element is a bare `auth-param` when its first `token` is
+/// immediately followed (modulo §11.2 BWS around `=`) by `=` with no
+/// intervening `1*SP` scheme/argument boundary. Everything else opens a
+/// new challenge, whose first whitespace-delimited token is the
+/// `auth-scheme` and whose remainder (if any) is the first `token68` or
+/// first `auth-param`.
+///
+/// ## Token68 vs auth-param within a challenge
+///
+/// §11.2's `token68` may end in `*"="`, which collides with the
+/// `auth-param` `=`. The parser treats a challenge argument as
+/// `token68` only when it is one whitespace-free run whose body is all
+/// `token68` characters with any `=` confined to a trailing pad run AND
+/// it is not of `name=value` `auth-param` shape; otherwise the
+/// remainder is parsed as the `#auth-param` list. Once a challenge has
+/// committed to `auth-param`s, subsequent bare `auth-param` elements
+/// attach to it.
+///
+/// ## Robustness
+///
+/// Matching the rest of the driver's §5.6.1 list handling, malformed
+/// pieces are skipped rather than failing the whole parse: an empty
+/// list element (the §11.6.1 "comma, whitespace, comma" note calls this
+/// harmless), an `auth-param` slot that is not `token = (token /
+/// quoted-string)`, or a leading bare `auth-param` with no challenge to
+/// attach to are all dropped while the surrounding well-formed
+/// challenges survive. An `obs-fold` (RFC 7230 §3.2.4) anywhere in the
+/// value is normalised to a single SP before parsing.
+///
+/// The same grammar backs `Proxy-Authenticate` (§11.7.1) and, with the
+/// `credentials = auth-scheme [ 1*SP ( token68 / #auth-param ) ]`
+/// production being identical, a single `Authorization` /
+/// `Proxy-Authorization` value (which carries exactly one challenge-
+/// shaped `credentials`); a caller wanting just the credentials reads
+/// the first element of the returned `Vec`.
+pub fn parse_www_authenticate(s: &str) -> Vec<Challenge> {
+    let normalized = normalize_obs_fold(s);
+    // §5.6.1 `#`-list: quoted-string-aware top-level comma split. We
+    // reuse split_directive_list — its quoted-string awareness and
+    // §5.6.3 OWS-trim / empty-drop are exactly the §11.6.1 list posture.
+    let elements = split_directive_list(&normalized);
+    let mut out: Vec<Challenge> = Vec::new();
+
+    for elem in elements {
+        // Classify: does this element start a new challenge, or is it a
+        // bare auth-param attaching to the current one?
+        if let Some((scheme, rest)) = split_challenge_head(elem) {
+            // New challenge. `scheme` is the auth-scheme token; `rest`
+            // (already OWS-trimmed) is the first token68 / first
+            // auth-param, or empty.
+            let mut ch = Challenge {
+                scheme: scheme.to_ascii_lowercase(),
+                token68: None,
+                params: Vec::new(),
+            };
+            if !rest.is_empty() {
+                if let Some(t68) = as_token68(rest) {
+                    ch.token68 = Some(t68.to_owned());
+                } else if let Some(pair) = parse_one_auth_param(rest) {
+                    ch.params.push(pair);
+                }
+                // A non-empty rest that is neither a token68 nor a valid
+                // auth-param is dropped (malformed first argument); the
+                // scheme survives so a caller still sees the challenge.
+            }
+            out.push(ch);
+        } else {
+            // Bare auth-param: attach to the challenge in progress. A
+            // challenge that committed to token68 cannot also take
+            // auth-params (§11.3 mutual exclusivity); in that case, and
+            // when there is no current challenge at all, the orphan slot
+            // is dropped.
+            if let Some(cur) = out.last_mut() {
+                if cur.token68.is_none() {
+                    if let Some(pair) = parse_one_auth_param(elem) {
+                        cur.params.push(pair);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Classify a §5.6.1 list element as a challenge head.
+///
+/// Returns `Some((auth-scheme, rest))` when the element opens a new
+/// challenge — i.e. its first `token` is the `auth-scheme` and is NOT
+/// immediately followed (modulo §11.2 BWS) by `=` (which would make the
+/// element a bare `auth-param` of the *current* challenge). `rest` is the
+/// OWS-trimmed remainder after the `1*SP` that separates the scheme from
+/// its first `token68` / `auth-param` (empty when the challenge is just a
+/// bare scheme).
+///
+/// Returns `None` when the element is a bare `auth-param`
+/// (`token BWS "=" …`) or has no leading `token` at all.
+fn split_challenge_head(elem: &str) -> Option<(&str, &str)> {
+    let bytes = elem.as_bytes();
+    // The element is already OWS-trimmed by split_directive_list, so it
+    // starts at the first non-OWS byte. Read the leading token run.
+    let mut i = 0usize;
+    while i < bytes.len() && is_tchar(bytes[i]) {
+        i += 1;
+    }
+    if i == 0 {
+        // No leading token (starts with `=`, a quote, whitespace, …):
+        // not a challenge head.
+        return None;
+    }
+    let head = &elem[..i];
+    // What follows the leading token?
+    //   - end of element        -> bare scheme, no argument.
+    //   - 1*SP then more        -> scheme + (token68 / first auth-param).
+    //   - [BWS] "=" …           -> bare auth-param (NOT a challenge head).
+    // Peek past optional BWS (SP / HTAB — §11.2 allows "bad" whitespace
+    // around the `=`).
+    let mut j = i;
+    while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+        j += 1;
+    }
+    if j >= bytes.len() {
+        // Bare scheme (possibly with trailing whitespace already trimmed).
+        return Some((head, ""));
+    }
+    if bytes[j] == b'=' {
+        // `token [BWS] "="` — this element is an auth-param, not a
+        // challenge head. Defer to the caller's bare-auth-param branch.
+        return None;
+    }
+    if j == i {
+        // No SP/HTAB separator and the abutting byte is not `=`: a
+        // non-tchar byte directly follows the leading token run (e.g.
+        // `bad()` or `Basic"x"`). This is neither a clean `auth-scheme`
+        // (which would have consumed the whole run as one token) nor a
+        // bare `auth-param` (`token [BWS] "="`), so it is malformed. Defer
+        // to the caller's bare-auth-param branch, which will drop it (it
+        // has no valid `token = value` shape) rather than fabricating a
+        // spurious challenge from the truncated leading token.
+        return None;
+    }
+    // There was at least one SP/HTAB before a non-`=` byte: this is the
+    // `auth-scheme 1*SP <arg>` form.
+    let rest = elem[j..].trim_matches(|c: char| c == ' ' || c == '\t');
+    Some((head, rest))
+}
+
+/// `token68` recogniser (RFC 9110 §11.2):
+///
+/// ```text
+/// token68 = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
+/// ```
+///
+/// Returns `Some(s)` when `s` is a non-empty `token68`: a `1*` run of the
+/// 66 unreserved-plus characters followed by an optional trailing run of
+/// `=` pad octets, AND `s` is NOT of `auth-param` `name=value` shape
+/// (which the §11.6.1 ambiguity note resolves toward auth-param). A
+/// `token68` never contains whitespace or an interior `=` that is
+/// followed by a non-`=` octet.
+fn as_token68(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    // Count the leading body run (no `=`).
+    let mut i = 0usize;
+    while i < bytes.len() && is_token68_body(bytes[i]) {
+        i += 1;
+    }
+    if i == 0 {
+        // token68 requires 1* body chars before the pad.
+        return None;
+    }
+    // Everything from i on MUST be `=` (the `*"="` pad).
+    if bytes[i..].iter().all(|&b| b == b'=') {
+        Some(s)
+    } else {
+        None
+    }
+}
+
+/// Single `auth-param` parser (RFC 9110 §11.2):
+///
+/// ```text
+/// auth-param = token BWS "=" BWS ( token / quoted-string )
+/// ```
+///
+/// Returns `Some((lowercased-name, decoded-value))` on a well-formed
+/// `auth-param`. Unlike the §5.6.6 `parameter` (which forbids whitespace
+/// around `=`), §11.2 explicitly allows BWS ("bad" whitespace) on BOTH
+/// sides of the `=`, so this parser trims SP/HTAB around the separator.
+/// The value is read through the §5.6.4 quoted-string unwrap when
+/// DQUOTE-wrapped and kept verbatim as a `token` otherwise. Returns
+/// `None` for a missing `=`, a non-`token` name, or a value that is
+/// neither a valid `token` nor a valid `quoted-string`.
+fn parse_one_auth_param(slot: &str) -> Option<(String, String)> {
+    let slot = slot.trim_matches(|c: char| c == ' ' || c == '\t');
+    let eq = slot.find('=')?;
+    // §11.2 BWS: trim SP/HTAB around `=` on both sides.
+    let name = slot[..eq].trim_matches(|c: char| c == ' ' || c == '\t');
+    let value = slot[eq + 1..].trim_matches(|c: char| c == ' ' || c == '\t');
+    if !is_token(name) {
+        return None;
+    }
+    let lname = name.to_ascii_lowercase();
+    if value.starts_with('"') {
+        // §5.6.4 quoted-string: unwrap + collapse quoted-pair. An
+        // unterminated / malformed quoted-string yields None (slot
+        // dropped).
+        let decoded = unquote_string(value)?.into_owned();
+        Some((lname, decoded))
+    } else if is_token(value) {
+        Some((lname, value.to_owned()))
+    } else {
+        None
+    }
+}
+
+/// `tchar` (RFC 9110 §5.6.2) membership test on a single byte — the
+/// byte-level companion to [`is_token`].
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// `token68` body-character (RFC 9110 §11.2, excluding the trailing `=`
+/// pad) membership test on a single byte.
+fn is_token68_body(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+}
+
 /// Header-parser wrappers exposed for the cargo-fuzz harness under
 /// `fuzz/`. Not part of the stable public surface; gated behind the
 /// `fuzz` cargo feature so the published artefact carries the same
@@ -2737,6 +3033,18 @@ pub mod __fuzz {
             n += usize::from(flag);
         }
         n
+    }
+    /// Fuzz-only wrapper for [`super::parse_www_authenticate`] —
+    /// exercises the RFC 9110 §11.6.1 `WWW-Authenticate = #challenge`
+    /// grammar (the §11.6.1 challenge/auth-param comma ambiguity, the
+    /// §11.2 `token68` vs `auth-param` discrimination, BWS-around-`=`
+    /// tolerance, quoted-string-aware splitting, §5.6.4 value unwrap) on
+    /// arbitrary input. Returns the count of recognised challenges so the
+    /// fuzzer can drive both the empty and many-challenge branches; the
+    /// parser must never panic and every returned scheme / param / token68
+    /// string must be valid UTF-8.
+    pub fn parse_www_authenticate(s: &str) -> usize {
+        super::parse_www_authenticate(s).len()
     }
 }
 
@@ -5841,5 +6149,238 @@ mod tests {
         assert_eq!(parse_delta_seconds(""), None);
         assert_eq!(parse_delta_seconds("+1"), None);
         assert_eq!(parse_delta_seconds("1 "), None);
+    }
+
+    // ----------------------------------------------------------------
+    // RFC 9110 §11.6.1 WWW-Authenticate challenge-list parser.
+    // ----------------------------------------------------------------
+
+    fn ch(scheme: &str, params: &[(&str, &str)]) -> Challenge {
+        Challenge {
+            scheme: scheme.to_owned(),
+            token68: None,
+            params: params
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn www_auth_empty_yields_no_challenges() {
+        assert!(parse_www_authenticate("").is_empty());
+        assert!(parse_www_authenticate("   ").is_empty());
+        // The §11.6.1 "comma, whitespace, comma" harmless-empty note.
+        assert!(parse_www_authenticate(", ,").is_empty());
+    }
+
+    #[test]
+    fn www_auth_bare_scheme_no_args() {
+        assert_eq!(
+            parse_www_authenticate("Negotiate"),
+            vec![ch("negotiate", &[])]
+        );
+    }
+
+    #[test]
+    fn www_auth_scheme_lowercased_case_insensitive() {
+        // §11.1: auth-scheme is a case-insensitive token.
+        assert_eq!(
+            parse_www_authenticate("BASIC realm=\"x\""),
+            vec![ch("basic", &[("realm", "x")])]
+        );
+    }
+
+    #[test]
+    fn www_auth_single_challenge_one_param() {
+        assert_eq!(
+            parse_www_authenticate("Basic realm=\"simple\""),
+            vec![ch("basic", &[("realm", "simple")])]
+        );
+    }
+
+    #[test]
+    fn www_auth_token68_form() {
+        // §11.2: token68 carries a base64-ish blob (here with `=` pad).
+        let got = parse_www_authenticate("Negotiate a87421bK3m");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].scheme, "negotiate");
+        assert_eq!(got[0].token68.as_deref(), Some("a87421bK3m"));
+        assert!(got[0].params.is_empty());
+    }
+
+    #[test]
+    fn www_auth_token68_with_trailing_pad() {
+        let got = parse_www_authenticate("Negotiate TlRMTVNTUAACAAAA==");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].token68.as_deref(), Some("TlRMTVNTUAACAAAA=="));
+    }
+
+    #[test]
+    fn www_auth_rfc_worked_example_two_challenges() {
+        // The canonical §11.6.1 example: two challenges, the second with
+        // three auth-params including a quoted-pair-escaped DQUOTE.
+        let got = parse_www_authenticate(
+            "Basic realm=\"simple\", Newauth realm=\"apps\", type=1, title=\"Login to \\\"apps\\\"\"",
+        );
+        assert_eq!(
+            got,
+            vec![
+                ch("basic", &[("realm", "simple")]),
+                ch(
+                    "newauth",
+                    &[
+                        ("realm", "apps"),
+                        ("type", "1"),
+                        ("title", "Login to \"apps\""),
+                    ],
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn www_auth_param_name_lowercased_value_case_preserved() {
+        // §11.2: param names case-insensitive (lowercased); value case is
+        // scheme-specific so it is preserved verbatim.
+        let got = parse_www_authenticate("Digest Realm=\"MixedCase\"");
+        assert_eq!(got, vec![ch("digest", &[("realm", "MixedCase")])]);
+    }
+
+    #[test]
+    fn www_auth_bws_around_equals_tolerated() {
+        // §11.2: auth-param permits BWS on both sides of `=`, unlike the
+        // §5.6.6 parameter production.
+        assert_eq!(
+            parse_www_authenticate("Basic realm = \"x\""),
+            vec![ch("basic", &[("realm", "x")])]
+        );
+    }
+
+    #[test]
+    fn www_auth_token_value_form() {
+        // auth-param value may be a bare token (here `type=1`).
+        assert_eq!(
+            parse_www_authenticate("Newauth type=1"),
+            vec![ch("newauth", &[("type", "1")])]
+        );
+    }
+
+    #[test]
+    fn www_auth_quoted_comma_does_not_split() {
+        // A comma inside a quoted-string value is part of the value, not a
+        // list delimiter.
+        assert_eq!(
+            parse_www_authenticate("Basic realm=\"a, b\""),
+            vec![ch("basic", &[("realm", "a, b")])]
+        );
+    }
+
+    #[test]
+    fn www_auth_two_basic_realms_distinct_challenges() {
+        // §11.5: a response can carry multiple challenges with the same
+        // scheme but different realms.
+        assert_eq!(
+            parse_www_authenticate("Basic realm=\"a\", Basic realm=\"b\""),
+            vec![
+                ch("basic", &[("realm", "a")]),
+                ch("basic", &[("realm", "b")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn www_auth_malformed_param_skipped_challenge_survives() {
+        // A param slot that is not token=(token/quoted-string) is dropped;
+        // the challenge and its good sibling params survive.
+        assert_eq!(
+            parse_www_authenticate("Digest realm=\"r\", bad(), nonce=\"n\""),
+            vec![ch("digest", &[("realm", "r"), ("nonce", "n")])]
+        );
+    }
+
+    #[test]
+    fn www_auth_unterminated_quoted_string_param_dropped() {
+        // An unterminated quoted-string value cannot be a slot delimiter
+        // boundary either; the splitter keeps it as one element and the
+        // per-slot parser drops the malformed value.
+        let got = parse_www_authenticate("Basic realm=\"oops");
+        assert_eq!(got, vec![ch("basic", &[])]);
+    }
+
+    #[test]
+    fn www_auth_leading_bare_param_with_no_challenge_dropped() {
+        // A bare auth-param with no preceding challenge has nothing to
+        // attach to; it is dropped.
+        assert!(parse_www_authenticate("realm=\"orphan\"").is_empty());
+    }
+
+    #[test]
+    fn www_auth_param_after_token68_challenge_dropped() {
+        // §11.3 mutual exclusivity: a challenge that committed to token68
+        // cannot also take auth-params. The stray param is dropped.
+        let got = parse_www_authenticate("Negotiate abc123, realm=\"x\"");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].token68.as_deref(), Some("abc123"));
+        assert!(got[0].params.is_empty());
+    }
+
+    #[test]
+    fn www_auth_obs_fold_normalised_before_parse() {
+        // RFC 7230 §3.2.4: an obs-fold becomes SP before list splitting.
+        assert_eq!(
+            parse_www_authenticate("Basic realm=\"a\",\r\n Digest realm=\"b\""),
+            vec![
+                ch("basic", &[("realm", "a")]),
+                ch("digest", &[("realm", "b")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn www_auth_scheme_then_first_param_then_more() {
+        // Scheme + first auth-param on the head element, then trailing
+        // auth-params attach to that same challenge.
+        assert_eq!(
+            parse_www_authenticate("Digest realm=\"r\", qop=\"auth\", nonce=\"n\""),
+            vec![ch(
+                "digest",
+                &[("realm", "r"), ("qop", "auth"), ("nonce", "n")]
+            )]
+        );
+    }
+
+    #[test]
+    fn www_auth_token68_not_confused_with_param() {
+        // A `name=value`-shaped first argument is an auth-param, never a
+        // token68 (the §11.6.1 ambiguity resolves toward auth-param).
+        let got = parse_www_authenticate("Custom foo=bar");
+        assert_eq!(got, vec![ch("custom", &[("foo", "bar")])]);
+    }
+
+    #[test]
+    fn as_token68_recogniser() {
+        assert_eq!(as_token68("abcXYZ09-._~+/"), Some("abcXYZ09-._~+/"));
+        assert_eq!(as_token68("abc=="), Some("abc=="));
+        assert_eq!(as_token68("=abc"), None); // pad-before-body
+        assert_eq!(as_token68("ab=cd"), None); // interior `=` then body
+        assert_eq!(as_token68(""), None);
+        assert_eq!(as_token68("a b"), None); // whitespace excluded
+    }
+
+    #[test]
+    fn parse_one_auth_param_shapes() {
+        assert_eq!(
+            parse_one_auth_param("Realm=\"x\""),
+            Some(("realm".to_string(), "x".to_string()))
+        );
+        assert_eq!(
+            parse_one_auth_param("type = 1"),
+            Some(("type".to_string(), "1".to_string()))
+        );
+        assert_eq!(parse_one_auth_param("noequals"), None);
+        assert_eq!(parse_one_auth_param("=novalue"), None);
+        assert_eq!(parse_one_auth_param("bad()=x"), None);
+        assert_eq!(parse_one_auth_param("k=\"unterminated"), None);
     }
 }

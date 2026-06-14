@@ -65,6 +65,12 @@
 //!   token/quoted-string arguments, §1.2.2 delta-seconds saturation,
 //!   §5.2.3 extension preservation). Contract: never panics; every
 //!   returned string is valid UTF-8.
+//! * `parse_www_authenticate` — RFC 9110 §11.6.1 `WWW-Authenticate =
+//!   #challenge` parser (the §11.6.1 challenge/auth-param comma
+//!   ambiguity, §11.2 `token68` vs `auth-param` discrimination,
+//!   BWS-around-`=` tolerance, quoted-string-aware splitting, §5.6.4
+//!   value unwrap). Contract: never panics; every returned scheme /
+//!   param / token68 string is valid UTF-8.
 //! * `derive_strong_validator` — §13.1.5 + §8.8.2.2 + §8.8.3
 //!   composite that picks an If-Range value from a HEAD's three
 //!   relevant headers.
@@ -93,6 +99,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = __fuzz::parse_media_type(s);
         let _ = __fuzz::non_identity_content_codings(s);
         let _ = __fuzz::parse_cache_control(s);
+        let _ = __fuzz::parse_www_authenticate(s);
     }
 
     // Pass 2: NUL-split the input into up to three fields for the

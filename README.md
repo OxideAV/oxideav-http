@@ -489,6 +489,72 @@ extension consumer can still inspect them). A malformed element
 (bad token name, OWS around `=`, unterminated quoted-string) is
 skipped, never a hard error.
 
+## WWW-Authenticate challenge parse (RFC 9110 §11.6.1)
+
+`parse_www_authenticate` reads a `WWW-Authenticate` (or
+`Proxy-Authenticate`) field value into a `Vec<Challenge>` per §11.6.1:
+
+```text
+WWW-Authenticate = #challenge
+challenge        = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+auth-scheme      = token
+auth-param       = token BWS "=" BWS ( token / quoted-string )
+token68          = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~"
+                       / "+" / "/" ) *"="
+```
+
+Each `Challenge` carries the lowercased `auth-scheme` (§11.1 —
+case-insensitive token), an optional `token68` (the base64-ish blob form
+used by schemes like Negotiate), and an ordered list of
+`(lowercased-name, decoded-value)` `auth-param` pairs. Per §11.3 a
+challenge carries EITHER a `token68` OR `auth-param`s, never both.
+
+The §11.6.1 ambiguity is the interesting part: both the challenge list
+AND each challenge's `auth-param` list are comma-separated, so a flat
+comma split cannot tell "next challenge" from "next param of the current
+challenge". The parser does a quoted-string-aware top-level comma split
+(§5.6.1 — a comma inside a `"…"` value never splits) then classifies
+each element:
+
+- a **bare `auth-param`** (`token BWS "=" …`) has no scheme of its own,
+  so it attaches to the challenge currently being built;
+- a **challenge head** (`auth-scheme` alone, or `auth-scheme 1*SP
+  <arg>`) starts a new challenge.
+
+The canonical §11.6.1 worked example —
+
+```text
+Basic realm="simple", Newauth realm="apps", type=1, title="Login to \"apps\""
+```
+
+— parses as **two** challenges: `basic` with `realm="simple"`, and
+`newauth` with `realm="apps", type=1, title="Login to "apps""` (the
+`\"` quoted-pair collapsed via the §5.6.4 helper).
+
+§11.2 details honoured: BWS ("bad" whitespace) is tolerated on both
+sides of the `=` (unlike the stricter §5.6.6 `parameter` production);
+`auth-param` names are lowercased (case-insensitive) while values keep
+their case (value case-sensitivity is scheme-specific); a quoted value
+is unwrapped through the §5.6.4 `quoted-string` reader and a bare token
+value is kept verbatim. A `name=value`-shaped first argument is always
+read as an `auth-param`, never a `token68` (the §11.6.1 note resolves
+the ambiguity toward `auth-param`).
+
+Robustness matches the rest of the driver's §5.6.1 list handling:
+empty list elements (the §11.6.1 "comma, whitespace, comma" note calls
+these harmless), malformed `auth-param` slots, a leading bare
+`auth-param` with no challenge to attach to, and an `auth-param`
+trailing a `token68` challenge are all skipped while the surrounding
+well-formed challenges survive. An `obs-fold` (RFC 7230 §3.2.4) is
+normalised to a single SP first. The same production backs
+`Proxy-Authenticate` (§11.7.1) and a single-`credentials`
+`Authorization` value (read the first element of the returned `Vec`).
+
+No in-driver caller wires this yet — the driver issues unauthenticated
+`HEAD` / `Range` requests — but the primitive is exported so a consumer
+acting on a 401 / 407 can inspect the offered schemes and realms without
+re-implementing the §11.6.1 grammar.
+
 ## Fuzzing
 
 `fuzz/` carries a cargo-fuzz harness (`parse_headers`) that drives
@@ -511,6 +577,9 @@ parameters`),
 list filter behind the content-coding refusal),
 `parse_cache_control` (RFC 9111 §5.2 `Cache-Control =
 #cache-directive`),
+`parse_www_authenticate` (RFC 9110 §11.6.1 `WWW-Authenticate =
+#challenge` with the §11.6.1 challenge/auth-param list disambiguation
+and §11.2 `token68` vs `auth-param` discrimination),
 and the composite
 `derive_strong_validator` (§13.1.5 + §8.8.2.2 + §8.8.3).
 The harness
