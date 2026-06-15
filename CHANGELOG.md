@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-http/compare/v0.0.7...v0.0.8) - 2026-06-15
+
+### Other
+
+- RFC 9110 §5.6.5 parser with nested-comment recursion + quoted-pair collapse
+- RFC 9110 §11.6.1 #challenge parser with list disambiguation
+- add RFC 9111 §5.2 Cache-Control directive parser
+- §12.5.5 Vary content-negotiation stability check at open
+- refuse coded representations (RFC 9110 §8.4 + §12.5.3)
+- RFC 9110 §8.3.1 parser composing §5.6.2 token + §5.6.6 parameters
+- RFC 9110 §5.6.6 list parser + 23 unit tests + fuzz coverage
+- RFC 9110 §5.6.4 unwrap + quoted-pair collapse primitive
+- drop release-plz.toml — use release-plz defaults across the workspace
+- RFC 7230 §3.2.4 normaliser + wire on Accept-Ranges / Retry-After
+- multipart/byteranges + Retry-After surfacing: RFC 9110 §15.3.7.2 + §10.2.3
+- §14.3 list-form parser + 4 distinct classifications
+- §10.2.3 parser + 15 unit tests + fuzz coverage
+- accept rfc850 + asctime forms in §13.1.5 validator path
+
 ### Added
 
 - RFC 9110 §5.6.5 `comment` parser. New internal `parse_comment` reads
