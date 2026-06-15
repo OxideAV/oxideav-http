@@ -384,6 +384,43 @@ processed by this helper one slot at a time).
 The helper is exercised by 23 unit tests and the cargo-fuzz
 `parse_headers` harness through the `__fuzz` re-export gate.
 
+## Comment parse (RFC 9110 §5.6.5)
+
+`parse_comment` reads a `comment` production into its logical text:
+
+```text
+comment = "(" *( ctext / quoted-pair / comment ) ")"
+ctext   = HTAB / SP / %x21-27 / %x2A-5B / %x5D-7E / obs-text
+```
+
+It strips the outermost parentheses, collapses every §5.6.4
+`quoted-pair` to the escaped octet (the same MUST `unquote_string`
+applies for a §5.6.4 quoted-string), and preserves balanced
+nested-comment delimiters
+verbatim — `(a (b) c)` is one comment whose text is `a (b) c`. The
+`ctext` holes at `(` / `)` / `\` carry meaning only through the comment
+recursion or the escape, so a bare one of those bytes is illegal text.
+
+The value is rejected (`None`) when it is not a single syntactically
+valid comment: missing outer parens, content after the matching close
+paren, an unbalanced paren, a bare control byte (e.g. CR / LF), or a
+dangling / illegal `quoted-pair` (notably `\` before a bare CR / LF,
+which would unbalance the field line). Recursion depth is tracked with
+an explicit counter rather than the call stack, so an adversarial
+deeply nested `((((…))))` input cannot overflow the stack. The
+escape-free single-level happy path borrows the input slice (zero
+allocations); only an actual `quoted-pair` allocates.
+
+This completes the §5.6 generic-syntax primitive family already in the
+crate (§5.6.1 list, §5.6.2 token, §5.6.4 quoted-string, §5.6.6
+parameters, §5.6.7 date). §5.6.5 permits comments only "in fields
+containing 'comment' as part of their field value definition" —
+`User-Agent` / `Server` (§10.1.5 / §10.2.4), `Via` (§7.6.3), and the
+`Warning` field (RFC 7234 §5.5). No in-driver caller wires this yet
+(the driver issues unauthenticated `HEAD` / `Range` requests and acts
+on none of those response fields), but the primitive is exported for
+the fuzz harness and exercised by 10 unit tests.
+
 ## Media-type parse (RFC 9110 §8.3.1)
 
 `parse_media_type` composes the §5.6.2 `is_token` and §5.6.6
@@ -569,6 +606,8 @@ plus the unified §5.6.7 dispatcher `parse_http_date`,
 `format_retry_after_hint` (§10.2.3 HEAD surfacing helper),
 `normalize_obs_fold` (RFC 7230 §3.2.4 obs-fold normaliser),
 `unquote_string` (RFC 9110 §5.6.4 quoted-string unwrap),
+`parse_comment` (RFC 9110 §5.6.5 `comment = "(" *( ctext /
+quoted-pair / comment ) ")"` with nested-comment recursion),
 `parse_parameters` (RFC 9110 §5.6.6 semicolon-delimited
 `name=value` list with quoted-string-aware splitting),
 `parse_media_type` (RFC 9110 §8.3.1 `media-type = type "/" subtype

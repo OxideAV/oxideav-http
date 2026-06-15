@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- RFC 9110 §5.6.5 `comment` parser. New internal `parse_comment` reads
+  a `comment = "(" *( ctext / quoted-pair / comment ) ")"` value into
+  its logical text — outer parentheses stripped, every `quoted-pair`
+  (§5.6.4) collapsed to the escaped octet, and balanced nested-comment
+  delimiters preserved verbatim as part of the content. `ctext`
+  (`HTAB / SP / %x21-27 / %x2A-5B / %x5D-7E / obs-text`) is validated
+  byte-for-byte, with the holes at `(` / `)` / `\` carrying meaning
+  only through the comment recursion or the escape; an unbalanced
+  paren, trailing content after the matching close, a bare control
+  byte, or a dangling/illegal `quoted-pair` is rejected (`None`).
+  Recursion depth is tracked with an explicit counter rather than the
+  call stack, so deeply nested `((((…))))` input cannot overflow.
+  Escape-free single-level input borrows the slice (zero allocation);
+  only a `quoted-pair` forces the owned path. This completes the §5.6
+  generic-syntax primitive family (§5.6.1 list / §5.6.2 token / §5.6.4
+  quoted-string / §5.6.6 parameters / §5.6.7 date already present) and
+  backs any future consumer of a `comment`-bearing field (`User-Agent`
+  / `Server` §10.1.5 / §10.2.4, `Via` §7.6.3, `Warning` RFC 7234
+  §5.5). No in-driver caller yet — the driver issues unauthenticated
+  `HEAD` / `Range` requests and acts on none of those response fields —
+  but the primitive is exercised by 10 unit tests and the cargo-fuzz
+  `parse_headers` harness through the `__fuzz` gate.
+
 - RFC 9110 §11.6.1 `WWW-Authenticate` challenge-list parser. New
   `parse_www_authenticate` reads a `WWW-Authenticate = #challenge`
   value into a `Vec<Challenge>`, where `Challenge` carries the

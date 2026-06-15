@@ -1449,6 +1449,150 @@ fn unquote_string(s: &str) -> Option<std::borrow::Cow<'_, str>> {
     }
 }
 
+/// Parse a `comment` production per RFC 9110 §5.6.5 into its logical
+/// text — the byte sequence between the outermost parentheses, with
+/// every `quoted-pair` collapsed to the octet that followed the
+/// backslash and the (balanced) nested-comment delimiters preserved
+/// verbatim as part of the text.
+///
+/// ```text
+/// comment = "(" *( ctext / quoted-pair / comment ) ")"
+/// ctext   = HTAB / SP / %x21-27 / %x2A-5B / %x5D-7E / obs-text
+/// ```
+///
+/// §5.6.5 only permits comments "in fields containing 'comment' as part
+/// of their field value definition" — `User-Agent` / `Server` (§10.1.5
+/// / §10.2.4 `product *( RWS ( product / comment ) )`), `Via`
+/// (RFC 9110 §7.6.3), and the `Warning` field of RFC 7234 §5.5 all carry
+/// a §5.6.5 `comment`. This crate issues unauthenticated `HEAD` / `Range`
+/// requests and does not yet act on any of those response fields, so
+/// there is no in-driver caller; the primitive completes the §5.6
+/// generic-syntax family (§5.6.1 list, §5.6.2 token, §5.6.4
+/// quoted-string, §5.6.6 parameters, §5.6.7 date are already present)
+/// and is exported for the cargo-fuzz harness so any panic mode is
+/// found by fuzzing.
+///
+/// Grammar notes the parser honours:
+///
+/// - The outermost `(` … `)` are required and stripped; the return is
+///   the inner content. An empty comment `()` decodes to the empty
+///   string.
+/// - `ctext` is `HTAB / SP / %x21-27 / %x2A-5B / %x5D-7E / obs-text`.
+///   Note the holes at `%x28` `(`, `%x29` `)`, and `%x5C` `\`: a bare
+///   one of those characters is NOT `ctext` and only carries meaning
+///   through the `comment` recursion (`(`/`)`) or the `quoted-pair`
+///   escape (`\`).
+/// - A `quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )` (§5.6.4) is
+///   collapsed to the single octet after the backslash, mirroring the
+///   §5.6.4 MUST applied by [`unquote_string`]. A bare `\` followed by
+///   an octet outside that RHS (notably bare CR / LF, which would
+///   unbalance the field line) is rejected.
+/// - Nested comments recurse: `(a (b) c)` is one comment whose text is
+///   `a (b) c` — the inner parentheses are preserved because they are
+///   part of the comment's logical content, not stripped a second time.
+///   Parentheses must be balanced; an unbalanced `(` or a `)` past the
+///   matching close is rejected.
+///
+/// Returns `None` for any input that is not a single syntactically
+/// valid `comment`: missing outer parens, content after the matching
+/// close paren, an unbalanced paren, an illegal bare byte, or a
+/// dangling / illegal `quoted-pair`. On the escape-free, single-level
+/// happy path the return borrows the input slice (zero allocations);
+/// only a `quoted-pair` forces the owned slow path.
+///
+/// The recursion depth is bounded by an explicit counter rather than
+/// real call-stack recursion, so a deeply nested adversarial input
+/// (`((((…))))`) cannot overflow the stack.
+#[allow(dead_code)]
+fn parse_comment(s: &str) -> Option<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
+    let bytes = s.as_bytes();
+    // Must be paren-wrapped and at least two bytes for the empty `()`.
+    if bytes.len() < 2 || bytes[0] != b'(' || bytes[bytes.len() - 1] != b')' {
+        return None;
+    }
+    let inner = &bytes[1..bytes.len() - 1];
+    // Fast pre-scan: validate every byte, track nesting depth, and
+    // detect whether any quoted-pair is present. If none, the inner
+    // slice can be returned borrowed.
+    let mut i = 0usize;
+    let mut depth: u32 = 0; // nesting below the outermost comment
+    let mut has_escape = false;
+    while i < inner.len() {
+        let b = inner[i];
+        match b {
+            b'\\' => {
+                // quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )
+                // VCHAR = %x21-7E; obs-text = %x80-FF.
+                let nxt = *inner.get(i + 1)?;
+                let ok = nxt == 0x09 || nxt == 0x20 || (0x21..=0x7E).contains(&nxt) || nxt >= 0x80;
+                if !ok {
+                    return None;
+                }
+                has_escape = true;
+                i += 2;
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                if depth == 0 {
+                    // A close paren at the top level ends the outermost
+                    // comment early — there would be trailing content
+                    // after the matching `)`, so the whole input is not
+                    // a single comment.
+                    return None;
+                }
+                depth -= 1;
+                i += 1;
+            }
+            // ctext = HTAB / SP / %x21-27 / %x2A-5B / %x5D-7E / obs-text
+            0x09 | 0x20 => i += 1,
+            0x21..=0x27 | 0x2A..=0x5B | 0x5D..=0x7E => i += 1,
+            _ if b >= 0x80 => i += 1, // obs-text
+            _ => return None,         // bare control byte etc.
+        }
+    }
+    // Every nested `(` opened in `inner` must have been closed before
+    // the outermost `)` we stripped; otherwise the parens are
+    // unbalanced.
+    if depth != 0 {
+        return None;
+    }
+    if !has_escape {
+        // The inner slice is a substring of `s` bounded on both ends by
+        // an ASCII byte (`(` / `)`), so [1, len-1] fall on UTF-8 code
+        // point boundaries.
+        return Some(Cow::Borrowed(
+            std::str::from_utf8(inner).expect("inner slice is UTF-8 by construction"),
+        ));
+    }
+    // Slow path: collapse each quoted-pair, preserving nested-comment
+    // delimiters verbatim.
+    let mut out: Vec<u8> = Vec::with_capacity(inner.len());
+    let mut i = 0usize;
+    while i < inner.len() {
+        let b = inner[i];
+        if b == b'\\' {
+            // Validated above; emit the next octet verbatim.
+            out.push(inner[i + 1]);
+            i += 2;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    // The escape's RHS may sever a multi-byte UTF-8 sequence boundary
+    // if a sender backslash-escaped a single continuation byte, so run
+    // a checked conversion rather than assume validity (same posture as
+    // `unquote_string`).
+    match String::from_utf8(out) {
+        Ok(decoded) => Some(Cow::Owned(decoded)),
+        Err(_) => None,
+    }
+}
+
 /// Parse a `parameters` production per RFC 9110 §5.6.6 into an ordered
 /// `Vec<(name, value)>` of `(lowercase-name, decoded-value)` pairs.
 ///
@@ -2978,6 +3122,17 @@ pub mod __fuzz {
     /// outcome must be reachable without a panic.
     pub fn unquote_string(s: &str) -> Option<String> {
         super::unquote_string(s).map(|c| c.into_owned())
+    }
+    /// Fuzz-only wrapper for [`super::parse_comment`] — exercises the
+    /// RFC 9110 §5.6.5 `comment` grammar (outer-paren strip, nested
+    /// comment recursion with balanced-paren tracking, `quoted-pair`
+    /// collapse) on arbitrary input. Returns the decoded comment text
+    /// when the input is a single valid comment, `None` otherwise —
+    /// both outcomes must be reachable without a panic (and without a
+    /// stack overflow on deeply nested `((((…))))` input), and any
+    /// returned string must be valid UTF-8.
+    pub fn parse_comment(s: &str) -> Option<String> {
+        super::parse_comment(s).map(|c| c.into_owned())
     }
     /// Fuzz-only wrapper for [`super::parse_parameters`] — exercises the
     /// RFC 9110 §5.6.6 `parameters` grammar (semicolon-delimited
@@ -5509,6 +5664,112 @@ mod tests {
         // verbatim regardless of which bytes those are.
         let v = unquote_string("\"--my\\\"boundary--\"").unwrap();
         assert_eq!(&*v, "--my\"boundary--");
+    }
+
+    // --- §5.6.5 comment -----------------------------------------------
+
+    #[test]
+    fn parse_comment_empty_decodes_to_empty_borrowed() {
+        // §5.6.5 `comment = "(" *( … ) ")"` — an empty comment `()`
+        // is well-formed and its logical text is the empty string. No
+        // escapes ⇒ borrowed.
+        let v = parse_comment("()").unwrap();
+        assert_eq!(&*v, "");
+        assert!(matches!(v, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn parse_comment_escape_free_returns_cow_borrowed() {
+        // A flat comment with only `ctext` returns a borrow of the
+        // inner slice (zero allocation on the happy path).
+        let v = parse_comment("(gzip is fine)").unwrap();
+        assert_eq!(&*v, "gzip is fine");
+        assert!(matches!(v, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn parse_comment_nested_preserves_inner_parens() {
+        // §5.6.5 recursion: `(a (b) c)` is ONE comment whose logical
+        // text is `a (b) c` — only the outermost parens are stripped;
+        // the inner pair is part of the content.
+        let v = parse_comment("(a (b) c)").unwrap();
+        assert_eq!(&*v, "a (b) c");
+        // Deeper nesting balances correctly.
+        let v = parse_comment("(x ((y)) z)").unwrap();
+        assert_eq!(&*v, "x ((y)) z");
+    }
+
+    #[test]
+    fn parse_comment_quoted_pair_collapsed_per_5_6_4() {
+        // §5.6.5 admits `quoted-pair` inside a comment; §5.6.4's
+        // `quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )` is
+        // collapsed to the escaped octet. Here the escaped `(` and `)`
+        // and `\` are literal text, not comment/escape syntax.
+        let v = parse_comment("(a \\( b \\) c \\\\ d)").unwrap();
+        assert_eq!(&*v, "a ( b ) c \\ d");
+        assert!(matches!(v, std::borrow::Cow::Owned(_)));
+    }
+
+    #[test]
+    fn parse_comment_user_agent_shape() {
+        // The most common in-the-wild §5.6.5 comment is the parenthical
+        // in a `User-Agent` / `Server` `product *( RWS comment )` value.
+        let v = parse_comment("(Macintosh; Intel Mac OS X 10_15)").unwrap();
+        assert_eq!(&*v, "Macintosh; Intel Mac OS X 10_15");
+    }
+
+    #[test]
+    fn parse_comment_missing_outer_parens_rejected() {
+        assert!(parse_comment("no parens").is_none());
+        assert!(parse_comment("(unclosed").is_none());
+        assert!(parse_comment("unopened)").is_none());
+        // A single byte cannot carry both `(` and `)`.
+        assert!(parse_comment("(").is_none());
+        assert!(parse_comment(")").is_none());
+        assert!(parse_comment("").is_none());
+    }
+
+    #[test]
+    fn parse_comment_unbalanced_parens_rejected() {
+        // One extra opener: depth never returns to zero.
+        assert!(parse_comment("(a (b)").is_none());
+        // A top-level closer ends the comment early, leaving trailing
+        // content after the matching `)`.
+        assert!(parse_comment("(a) b)").is_none());
+        assert!(parse_comment("(a)(b)").is_none());
+    }
+
+    #[test]
+    fn parse_comment_bare_control_byte_rejected() {
+        // §5.6.5 `ctext` excludes the controls below HTAB/SP except the
+        // two it lists (HTAB, SP). A bare CR / LF / NUL is not ctext.
+        assert!(parse_comment("(a\rb)").is_none());
+        assert!(parse_comment("(a\nb)").is_none());
+        assert!(parse_comment("(a\u{0}b)").is_none());
+        // HTAB and SP ARE ctext.
+        assert_eq!(&*parse_comment("(a\tb c)").unwrap(), "a\tb c");
+    }
+
+    #[test]
+    fn parse_comment_dangling_or_illegal_quoted_pair_rejected() {
+        // Trailing lone `\` with nothing to escape.
+        assert!(parse_comment("(abc\\)").is_none());
+        // `\` followed by a bare CR/LF is outside the §5.6.4
+        // quoted-pair RHS (would unbalance the field line).
+        assert!(parse_comment("(a\\\rb)").is_none());
+        assert!(parse_comment("(a\\\nb)").is_none());
+    }
+
+    #[test]
+    fn parse_comment_obs_text_byte_accepted() {
+        // §5.6.5 `ctext` admits obs-text (%x80-FF). A UTF-8 multibyte
+        // sequence is all obs-text bytes and survives unescaped.
+        let v = parse_comment("(café)").unwrap();
+        assert_eq!(&*v, "café");
+        // And as an escaped octet, the obs-text byte is emitted verbatim
+        // (here the escaped multibyte forms valid UTF-8 in aggregate).
+        let v = parse_comment("(a \\é b)").unwrap();
+        assert_eq!(&*v, "a é b");
     }
 
     // --- §5.6.6 parameters ---------------------------------------------
