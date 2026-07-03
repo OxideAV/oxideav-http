@@ -1,5 +1,7 @@
 # oxideav-http
 
+[![CI](https://github.com/OxideAV/oxideav-http/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-http/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-http.svg)](https://crates.io/crates/oxideav-http) [![docs.rs](https://docs.rs/oxideav-http/badge.svg)](https://docs.rs/oxideav-http) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 HTTP/HTTPS source driver for oxideav (pure-Rust via ureq + rustls + webpki-roots).
 
 Registers as a `BytesSource` on the new typed `SourceRegistry`, so
