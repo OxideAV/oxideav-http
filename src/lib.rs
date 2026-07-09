@@ -4683,6 +4683,147 @@ mod tests {
         assert_eq!(log.len(), 3, "expected HEAD + 2 GETs, got {log:#?}");
     }
 
+    // -- RFC 9112 §7.1 chunked framing composed with the driver --------------
+    //
+    // The transport layer owns dechunking; these tests pin that every
+    // driver invariant (span accounting, prefix drain, §14.2 resume,
+    // storm bounds) composes correctly with chunked-framed responses,
+    // including the §7.1.1 extension and §7.1.2 trailer constructs and
+    // the §8 incomplete-body rule.
+
+    #[test]
+    fn local_server_chunked_206_with_extensions_and_trailer() {
+        // §7.1.1: "A recipient MUST ignore unrecognized chunk
+        // extensions"; §7.1.2 allows a trailer section. Neither may
+        // leak into the byte stream or disturb the span accounting.
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Transfer-Encoding: chunked\r\n\
+            Connection: close\r\n\
+            \r\n\
+            4;sig=abc\r\n\
+            0123\r\n\
+            6\r\n\
+            456789\r\n\
+            0\r\n\
+            x-check: ok\r\n\
+            \r\n";
+        let (uri, reqs) = spawn_script_server(vec![HEAD_10B_BYTES.to_vec(), GET.to_vec()]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 2, "expected HEAD + 1 GET, got {log:#?}");
+    }
+
+    #[test]
+    fn local_server_chunked_206_incomplete_body_resumes() {
+        // RFC 9112 §8: "A message body that uses the chunked transfer
+        // coding is incomplete if the zero-sized chunk that terminates
+        // the encoding has not been received." The dechunker surfaces
+        // that as a transport fault; the §14.2 resume path must
+        // re-request bytes=4- and splice.
+        static GET1: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Transfer-Encoding: chunked\r\n\
+            Connection: close\r\n\
+            \r\n\
+            4\r\n\
+            0123\r\n";
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_10B_BYTES.to_vec(),
+            GET1.to_vec(),
+            make_get_206("bytes 4-9/10", b"456789"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 3, "expected HEAD + 2 GETs, got {log:#?}");
+        assert!(
+            log[2].to_ascii_lowercase().contains("range: bytes=4-"),
+            "resume must start at the incomplete-body point: {:?}",
+            log[2]
+        );
+    }
+
+    #[test]
+    fn local_server_chunked_200_fallback_prefix_drain() {
+        // A range-ignoring server (RFC 7233 §3.1 200 fallback) that
+        // also frames with chunked: the prefix drain must operate on
+        // the DECODED bytes.
+        static GET: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Transfer-Encoding: chunked\r\n\
+            Connection: close\r\n\
+            \r\n\
+            a\r\n\
+            0123456789\r\n\
+            0\r\n\
+            \r\n";
+        let (uri, _reqs) = spawn_script_server(vec![HEAD_10B_BYTES.to_vec(), GET.to_vec()]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        std::io::Seek::seek(&mut src, SeekFrom::Start(4)).expect("seek");
+        let mut buf = [0u8; 6];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"456789");
+    }
+
+    #[test]
+    fn local_server_chunked_206_excess_decoded_bytes_stop_at_span() {
+        // Chunked framing carries 16 decoded bytes but Content-Range
+        // declares a 10-byte span. §15.3.7 makes the 206
+        // self-descriptive — the 6 excess bytes must never reach the
+        // reader.
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Transfer-Encoding: chunked\r\n\
+            Connection: close\r\n\
+            \r\n\
+            10\r\n\
+            0123456789ABCDEF\r\n\
+            0\r\n\
+            \r\n";
+        let (uri, _reqs) = spawn_script_server(vec![HEAD_10B_BYTES.to_vec(), GET.to_vec()]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut src, &mut buf).expect("read");
+        assert_eq!(buf, b"0123456789");
+    }
+
+    #[test]
+    fn local_server_hostile_chunk_size_errors_without_storm() {
+        // §7.1: "recipients MUST anticipate potentially large
+        // hexadecimal numerals and prevent parsing errors due to
+        // integer conversion overflows". The transport layer rejects
+        // the 17-hex-digit chunk size; the driver must surface an
+        // error with a BOUNDED number of requests (a transient-classed
+        // fault may consume the resume budget, but never more).
+        static GET: &[u8] = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Transfer-Encoding: chunked\r\n\
+            Connection: close\r\n\
+            \r\n\
+            FFFFFFFFFFFFFFFF1\r\n\
+            junk";
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_10B_BYTES.to_vec(),
+            GET.to_vec(),
+            GET.to_vec(),
+            GET.to_vec(),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        let err = std::io::Read::read_exact(&mut src, &mut buf).unwrap_err();
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert!(
+            (2..=4).contains(&log.len()),
+            "bounded requests required (got {} — {err}): {log:#?}",
+            log.len()
+        );
+    }
+
     // -- EOF / bounds edges: no wasted wire ----------------------------------
 
     const HEAD_0B_BYTES: &[u8] = b"HTTP/1.1 200 OK\r\n\

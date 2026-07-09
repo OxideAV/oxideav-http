@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Chunked-framing composition coverage (RFC 9112 §7.1 + §8): scripted
+  loopback tests pin that span accounting, the 200-fallback prefix
+  drain, §14.2 resume, and the request-storm bounds all compose
+  correctly with chunked-framed responses — §7.1.1 chunk extensions
+  and a §7.1.2 trailer section never leak into the byte stream, a body
+  missing its zero-sized terminal chunk (incomplete per §8) resumes
+  seamlessly, decoded bytes beyond the declared Content-Range span
+  never reach the reader, and a hostile 17-hex-digit chunk size (§7.1
+  overflow anticipation) errors with a bounded request count.
+
 - Opt-in GET range-probe fallback for HEAD-hostile servers — new
   `HttpConfig::range_probe` knob (builder `range_probe(true)`, default
   `false` keeps the historical refusals). When HEAD answers 405/501
