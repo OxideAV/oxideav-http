@@ -61,6 +61,17 @@
 //! 2, `0` disables). The resume GET carries `If-Range` whenever a
 //! strong validator exists, so a representation that mutated between
 //! the drop and the resume is refused (§13.1.5), never spliced.
+//!
+//! ## Seek-via-Range
+//!
+//! `Seek` maps onto fresh `Range: bytes=<target>-` GETs, with one
+//! economy: a forward hop of at most
+//! [`HttpConfigBuilder::seek_drain_max`] bytes (default 64 KiB) that
+//! stays inside the live body's declared span is satisfied by
+//! draining the open connection instead of a new request — demuxers
+//! skip small box/frame payloads constantly, and a request round trip
+//! per few-byte hop is the exact waste RFC 9110 §14.2's efficiency
+//! rationale warns against, in the other direction.
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::OnceLock;
@@ -141,6 +152,7 @@ pub struct HttpConfig {
     timeout_global: Option<Duration>,
     timeout_connect: Option<Duration>,
     read_retries: u32,
+    seek_drain_max: u64,
 }
 
 impl Default for HttpConfig {
@@ -158,6 +170,7 @@ impl Default for HttpConfig {
             timeout_global: None,
             timeout_connect: None,
             read_retries: 2,
+            seek_drain_max: 64 * 1024,
         }
     }
 }
@@ -215,6 +228,18 @@ impl HttpConfig {
     /// the first truncation surfaces as an error.
     pub fn read_retries(&self) -> u32 {
         self.read_retries
+    }
+
+    /// Longest forward seek (in bytes) the driver will satisfy by
+    /// draining the live response body instead of dropping the
+    /// connection and issuing a fresh range GET. Small forward hops
+    /// (a demuxer skipping a box or frame payload) are far cheaper as
+    /// a bounded drain than as a request round trip. Default 64 KiB;
+    /// `0` restores the historical always-reissue behaviour. The
+    /// stream position after either strategy is identical — only the
+    /// request count differs.
+    pub fn seek_drain_max(&self) -> u64 {
+        self.seek_drain_max
     }
 }
 
@@ -277,6 +302,14 @@ impl HttpConfigBuilder {
     /// re-requesting the remainder.
     pub fn read_retries(mut self, n: u32) -> Self {
         self.inner.read_retries = n;
+        self
+    }
+
+    /// Cap the forward-seek drain distance — see
+    /// [`HttpConfig::seek_drain_max`]. Default 64 KiB; `0` makes every
+    /// seek re-issue a range GET.
+    pub fn seek_drain_max(mut self, n: u64) -> Self {
+        self.inner.seek_drain_max = n;
         self
     }
 
@@ -411,6 +444,8 @@ pub struct HttpSource {
     /// Transparent mid-body resume budget per `read` call — see
     /// [`HttpConfig::read_retries`].
     read_retries: u32,
+    /// Forward-seek drain cap — see [`HttpConfig::seek_drain_max`].
+    seek_drain_max: u64,
 }
 
 impl HttpSource {
@@ -645,6 +680,7 @@ impl HttpSource {
             body: None,
             body_remaining: 0,
             read_retries: knobs.read_retries(),
+            seek_drain_max: knobs.seek_drain_max(),
         })
     }
 
@@ -658,6 +694,34 @@ impl HttpSource {
 
     fn agent_ref(&self) -> &Agent {
         self.agent.as_ref().unwrap_or_else(|| agent())
+    }
+
+    /// Consume exactly `n` bytes from the live body — the forward-seek
+    /// drain path. The caller has already checked `n` against both the
+    /// drain cap and the body's remaining declared span. Returns
+    /// `true` on success; on a transport fault or early EOF the body
+    /// is dropped and `false` is returned, and the caller falls back
+    /// to a fresh range GET (whose read path owns §14.2 recovery).
+    fn drain_forward(&mut self, mut n: u64) -> bool {
+        let Some(body) = self.body.as_mut() else {
+            return false;
+        };
+        let mut buf = [0u8; 8 * 1024];
+        while n > 0 {
+            let want = n.min(buf.len() as u64) as usize;
+            match body.read(&mut buf[..want]) {
+                Ok(got) if got > 0 => {
+                    n -= got as u64;
+                    self.body_remaining -= got as u64;
+                }
+                _ => {
+                    self.body = None;
+                    self.body_remaining = 0;
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     fn issue_range(&mut self) -> io::Result<()> {
@@ -2533,8 +2597,28 @@ impl Seek for HttpSource {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek past end"));
         }
         if new_pos != self.pos {
-            self.body = None;
-            self.body_remaining = 0;
+            // A short forward hop inside the live body's declared span
+            // is cheaper as a bounded drain than as a fresh range GET
+            // (request round trip + connection churn); demuxers skip
+            // small box/frame payloads constantly. RFC 9110 §14.2's
+            // own efficiency motivation cuts both ways — ranges avoid
+            // transferring the whole representation, but a range GET
+            // per few-byte skip is the opposite waste. The stream
+            // position is identical either way; only the request count
+            // differs. Draining never crosses the span boundary
+            // (§15.3.7: bytes beyond it were never promised) and never
+            // exceeds `seek_drain_max`.
+            let drained = new_pos > self.pos
+                && self.body.is_some()
+                && new_pos - self.pos <= self.seek_drain_max.min(self.body_remaining)
+                && self.drain_forward(new_pos - self.pos);
+            if !drained {
+                // Backward seek, long hop, span overrun, or a drain
+                // that hit a transport fault: drop the body and let
+                // the next read issue `Range: bytes=<new_pos>-`.
+                self.body = None;
+                self.body_remaining = 0;
+            }
             self.pos = new_pos;
         }
         Ok(new_pos)
@@ -3398,6 +3482,7 @@ mod tests {
         assert_eq!(c.timeout_global(), None);
         assert_eq!(c.timeout_connect(), None);
         assert_eq!(c.read_retries(), 2);
+        assert_eq!(c.seek_drain_max(), 64 * 1024);
     }
 
     #[test]
@@ -3411,6 +3496,7 @@ mod tests {
             .timeout_global(Some(Duration::from_secs(30)))
             .timeout_connect(Some(Duration::from_secs(5)))
             .read_retries(7)
+            .seek_drain_max(123)
             .build();
         assert_eq!(c.max_redirects(), 3);
         assert!(!c.max_redirects_will_error());
@@ -3420,6 +3506,7 @@ mod tests {
         assert_eq!(c.timeout_global(), Some(Duration::from_secs(30)));
         assert_eq!(c.timeout_connect(), Some(Duration::from_secs(5)));
         assert_eq!(c.read_retries(), 7);
+        assert_eq!(c.seek_drain_max(), 123);
     }
 
     #[test]
@@ -4167,6 +4254,144 @@ mod tests {
         let mut buf = [0u8; 10];
         std::io::Read::read_exact(&mut src, &mut buf).expect("read");
         assert_eq!(&buf, b"0123456789");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 3, "expected HEAD + 2 GETs, got {log:#?}");
+    }
+
+    // -- Forward-seek drain over the live body --------------------------------
+
+    #[test]
+    fn local_server_small_forward_seek_drains_live_body() {
+        // Read 2 bytes, hop forward 3 (well under the 64 KiB default
+        // drain cap), read the rest. The hop must be satisfied by
+        // draining the live body — exactly ONE ranged GET on the wire.
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_10B_BYTES.to_vec(),
+            make_get_206("bytes 0-9/10", b"0123456789"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut two = [0u8; 2];
+        std::io::Read::read_exact(&mut src, &mut two).expect("read prefix");
+        assert_eq!(&two, b"01");
+        std::io::Seek::seek(&mut src, SeekFrom::Current(3)).expect("seek");
+        let mut rest = [0u8; 5];
+        std::io::Read::read_exact(&mut src, &mut rest).expect("read rest");
+        assert_eq!(&rest, b"56789");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(
+            log.len(),
+            2,
+            "forward hop within the drain cap must not re-issue: {log:#?}"
+        );
+    }
+
+    #[test]
+    fn local_server_forward_seek_beyond_drain_cap_reissues() {
+        // With the cap tightened to 2 bytes, a 6-byte hop must drop
+        // the body and issue a fresh range GET at the target position.
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_10B_BYTES.to_vec(),
+            make_get_206("bytes 0-9/10", b"0123456789"),
+            make_get_206("bytes 8-9/10", b"89"),
+        ]);
+        let cfg = HttpConfig::builder().seek_drain_max(2).build();
+        let mut src = HttpSource::open_with_config(&uri, &cfg).expect("open");
+        let mut two = [0u8; 2];
+        std::io::Read::read_exact(&mut src, &mut two).expect("read prefix");
+        std::io::Seek::seek(&mut src, SeekFrom::Start(8)).expect("seek");
+        let mut rest = [0u8; 2];
+        std::io::Read::read_exact(&mut src, &mut rest).expect("read rest");
+        assert_eq!(&rest, b"89");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 3, "expected HEAD + 2 GETs, got {log:#?}");
+        assert!(
+            log[2].to_ascii_lowercase().contains("range: bytes=8-"),
+            "re-issue must target the seek destination: {:?}",
+            log[2]
+        );
+    }
+
+    #[test]
+    fn local_server_backward_seek_always_reissues() {
+        // Bytes already consumed are gone — a backward seek can never
+        // drain and must issue a fresh range GET at the target.
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_10B_BYTES.to_vec(),
+            make_get_206("bytes 0-9/10", b"0123456789"),
+            make_get_206("bytes 1-9/10", b"123456789"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut five = [0u8; 5];
+        std::io::Read::read_exact(&mut src, &mut five).expect("read prefix");
+        std::io::Seek::seek(&mut src, SeekFrom::Start(1)).expect("seek");
+        std::io::Read::read_exact(&mut src, &mut five).expect("re-read");
+        assert_eq!(&five, b"12345");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 3, "expected HEAD + 2 GETs, got {log:#?}");
+        assert!(
+            log[2].to_ascii_lowercase().contains("range: bytes=1-"),
+            "re-issue must target the seek destination: {:?}",
+            log[2]
+        );
+    }
+
+    #[test]
+    fn local_server_forward_seek_never_drains_past_declared_span() {
+        // The live body only covers bytes 0-4 (partial 206, §15.3.7);
+        // a hop to byte 6 exceeds its remaining span even though it is
+        // far below the drain cap. Bytes beyond the span were never
+        // promised — the driver must re-issue at the target instead of
+        // blocking on a drain the body cannot satisfy.
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_10B_BYTES.to_vec(),
+            make_get_206("bytes 0-4/10", b"01234"),
+            make_get_206("bytes 6-9/10", b"6789"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        // Materialise the partial body (span 0-4) by consuming byte 0.
+        let mut one = [0u8; 1];
+        std::io::Read::read_exact(&mut src, &mut one).expect("read byte 0");
+        assert_eq!(&one, b"0");
+        // Hop to 6: delta 5 exceeds the body's remaining span of 4.
+        std::io::Seek::seek(&mut src, SeekFrom::Start(6)).expect("seek");
+        let mut rest = [0u8; 4];
+        std::io::Read::read_exact(&mut src, &mut rest).expect("read");
+        assert_eq!(&rest, b"6789");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 3, "expected HEAD + 2 GETs, got {log:#?}");
+        assert!(
+            log[2].to_ascii_lowercase().contains("range: bytes=6-"),
+            "re-issue must target the seek destination: {:?}",
+            log[2]
+        );
+    }
+
+    #[test]
+    fn local_server_drain_hitting_truncated_body_falls_back_to_reissue() {
+        // The body declares bytes 0-9/10 but the connection dies after
+        // 2 body bytes. A 3-byte forward hop starts draining, hits the
+        // truncation, and must fall back to a fresh range GET at the
+        // seek target — seek itself never errors on a transport fault.
+        let mut get1 = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n"
+            .to_vec();
+        get1.extend_from_slice(b"01");
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_10B_BYTES.to_vec(),
+            get1,
+            make_get_206("bytes 3-9/10", b"3456789"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        // Materialise the body without consuming it past byte 0.
+        let mut one = [0u8; 1];
+        std::io::Read::read_exact(&mut src, &mut one).expect("read");
+        assert_eq!(&one, b"0");
+        std::io::Seek::seek(&mut src, SeekFrom::Start(3)).expect("seek");
+        let mut rest = [0u8; 7];
+        std::io::Read::read_exact(&mut src, &mut rest).expect("read rest");
+        assert_eq!(&rest, b"3456789");
         let log: Vec<String> = reqs.try_iter().collect();
         assert_eq!(log.len(), 3, "expected HEAD + 2 GETs, got {log:#?}");
     }

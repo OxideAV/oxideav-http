@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Forward-seek drain: a forward seek of at most
+  `HttpConfig::seek_drain_max` bytes (builder `seek_drain_max(n)`,
+  default 64 KiB, `0` restores always-reissue) that stays inside the
+  live body's declared span is now satisfied by draining the open
+  connection instead of dropping it and issuing a fresh range GET —
+  demuxers hop over small box/frame payloads constantly, and a request
+  round trip per few-byte skip is pure waste. Backward seeks, hops
+  past the cap or past the declared span (RFC 9110 §15.3.7 — bytes
+  beyond it were never promised), and drains that hit a transport
+  fault all fall back to the historical `Range: bytes=<target>-`
+  re-issue; `seek` itself never errors on a transport fault.
+
 - Transparent resume after mid-body transport drops (RFC 9110 §14.2:
   byte ranges "support efficient recovery from partially failed
   transfers"). A truncated body or a transport-shaped read error
