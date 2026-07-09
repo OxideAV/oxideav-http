@@ -72,6 +72,20 @@
 //! skip small box/frame payloads constantly, and a request round trip
 //! per few-byte hop is the exact waste RFC 9110 §14.2's efficiency
 //! rationale warns against, in the other direction.
+//!
+//! ## HEAD-hostile servers (opt-in `range_probe`)
+//!
+//! Some origins answer HEAD with 405/501, omit Content-Length on HEAD
+//! (explicitly permitted by RFC 9110 §9.3.2), or never advertise
+//! `Accept-Ranges` (§14.3 keeps the header advisory and lets clients
+//! probe anyway). With [`HttpConfigBuilder::range_probe`] enabled the
+//! driver falls back to a `Range: bytes=0-` GET: a 206 proves range
+//! support, its Content-Range supplies the complete-length (§14.4),
+//! and its body becomes the initial read stream — a successful probe
+//! costs no extra request. A 200 (server ignored `Range`, §14.2 MAY)
+//! is refused; a 416 with `bytes */0` yields an empty source (§14.1.2
+//! makes `bytes=0-` unsatisfiable against a zero-length
+//! representation, so that 416 is range support working correctly).
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::OnceLock;
@@ -153,6 +167,7 @@ pub struct HttpConfig {
     timeout_connect: Option<Duration>,
     read_retries: u32,
     seek_drain_max: u64,
+    range_probe: bool,
 }
 
 impl Default for HttpConfig {
@@ -171,6 +186,7 @@ impl Default for HttpConfig {
             timeout_connect: None,
             read_retries: 2,
             seek_drain_max: 64 * 1024,
+            range_probe: false,
         }
     }
 }
@@ -241,6 +257,22 @@ impl HttpConfig {
     pub fn seek_drain_max(&self) -> u64 {
         self.seek_drain_max
     }
+
+    /// Whether `open` may fall back to probing range support with a
+    /// `Range: bytes=0-` GET when the HEAD hand-shake is inconclusive:
+    /// HEAD answered 405 / 501 (RFC 9110 §15.5.6 / §15.6.2), HEAD
+    /// omitted Content-Length (§9.3.2 explicitly permits omitting
+    /// fields "determined only while generating the content"), or the
+    /// response carried no Accept-Ranges field (§14.3: "A client MAY
+    /// generate range requests regardless of having received an
+    /// Accept-Ranges field"). The probe's 206 must self-describe the
+    /// resource (Content-Range complete-length) and its body is used
+    /// as the initial read stream, so a successful probe costs no
+    /// extra request. Default `false` — such servers are refused at
+    /// open, as before.
+    pub fn range_probe(&self) -> bool {
+        self.range_probe
+    }
 }
 
 /// Builder for [`HttpConfig`].
@@ -310,6 +342,14 @@ impl HttpConfigBuilder {
     /// seek re-issue a range GET.
     pub fn seek_drain_max(mut self, n: u64) -> Self {
         self.inner.seek_drain_max = n;
+        self
+    }
+
+    /// Allow `open` to probe range support with a `Range: bytes=0-`
+    /// GET when HEAD is inconclusive — see
+    /// [`HttpConfig::range_probe`]. Default `false`.
+    pub fn range_probe(mut self, v: bool) -> Self {
+        self.inner.range_probe = v;
         self
     }
 
@@ -496,6 +536,22 @@ impl HttpSource {
 
         let status = head.status();
         if !status.is_success() {
+            // 405 (§15.5.6: "the method received ... is known by the
+            // origin server but not supported by the target resource")
+            // and 501 (§15.6.2: server "does not recognize the request
+            // method") say nothing about the resource's range support —
+            // only that HEAD specifically is off the table. When the
+            // caller opted in, learn the metadata from a ranged GET
+            // instead.
+            if knobs.range_probe() && (status == 405 || status == 501) {
+                return Self::probe_open(
+                    uri,
+                    scoped,
+                    &knobs,
+                    None,
+                    &format!("after HEAD status {status}"),
+                );
+            }
             // RFC 9110 §10.2.3: when sent with 503 (Service Unavailable),
             // Retry-After indicates how long the service is expected to
             // be unavailable; with 3xx (Redirection) responses it
@@ -507,19 +563,7 @@ impl HttpSource {
             // does NOT sleep — interpreting an absolute UTC date
             // requires a clock the source does not own, and back-off
             // strategy belongs in the caller.
-            let retry_after = head
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .map(normalize_obs_fold);
-            // RFC 7230 §3.2.4: normalise obs-fold "prior to interpreting
-            // the field value". `format_retry_after_hint` is the
-            // interpretation step here, so the normalisation must
-            // happen before it sees the input.
-            let retry_msg = retry_after
-                .as_deref()
-                .map(format_retry_after_hint)
-                .unwrap_or_default();
+            let retry_msg = retry_after_hint_of(head.headers());
             return Err(Error::other(format!(
                 "HTTP HEAD {uri}: status {status}{retry_msg}"
             )));
@@ -539,16 +583,7 @@ impl HttpSource {
         // form may be split across lines per §5.6.1) and tolerates only
         // the redundant `identity` token. Obs-fold is normalised before
         // interpretation per RFC 7230 §3.2.4.
-        let mut head_codings: Vec<String> = Vec::new();
-        for v in headers.get_all("content-encoding") {
-            match v.to_str() {
-                Ok(s) => head_codings.extend(non_identity_content_codings(&normalize_obs_fold(s))),
-                // A field value we cannot even read as a string cannot
-                // name a coding we know how to leave alone — fail
-                // toward rejection, never toward silent acceptance.
-                Err(_) => head_codings.push("<non-ASCII content-coding>".to_owned()),
-            }
-        }
+        let head_codings = non_identity_codings_in(headers);
         if !head_codings.is_empty() {
             return Err(Error::Unsupported(format!(
                 "HTTP HEAD {uri}: representation carries Content-Encoding {head_codings:?} \
@@ -557,13 +592,26 @@ impl HttpSource {
                  driver does not decode"
             )));
         }
-        let total_len = headers
+        let head_len = headers
             .get("content-length")
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .ok_or_else(|| {
-                Error::Unsupported(format!("HTTP HEAD {uri}: missing Content-Length"))
-            })?;
+            .and_then(|s| s.parse::<u64>().ok());
+        let total_len = match head_len {
+            Some(n) => n,
+            // §9.3.2: "a server MAY omit header fields for which a
+            // value is determined only while generating the content",
+            // and its worked example names Content-Length as exactly
+            // such a field on HEAD. The GET's own metadata is the
+            // authoritative fallback when the caller opted in.
+            None if knobs.range_probe() => {
+                return Self::probe_open(uri, scoped, &knobs, None, "HEAD omitted Content-Length");
+            }
+            None => {
+                return Err(Error::Unsupported(format!(
+                    "HTTP HEAD {uri}: missing Content-Length"
+                )));
+            }
+        };
         // RFC 9110 §14.3: `Accept-Ranges = 1#range-unit`. Use the §5.6.1
         // list parser instead of a bare equality so a server returning
         // `Accept-Ranges: bytes, foo-unit` (legitimate per §14.3) is
@@ -597,80 +645,30 @@ impl HttpSource {
             AcceptRanges::Absent => {
                 // §14.3: "A client MAY generate range requests
                 // regardless of having received an Accept-Ranges
-                // field." But the present driver's correctness model
-                // (validate Content-Range echo etc.) needs the server
-                // to actually satisfy them, and a HEAD that omits the
-                // hint is also far more likely to refuse. Preserve
-                // the historical refusal here so we don't quietly
-                // start issuing Range GETs against servers we'd have
-                // refused before; the message is now distinct.
+                // field." The header is advisory, not mandatory, even
+                // for range-capable servers — with the probe opt-in we
+                // exercise that MAY and let an actual 206 (validated
+                // against the HEAD-observed length) prove support.
+                if knobs.range_probe() {
+                    return Self::probe_open(
+                        uri,
+                        scoped,
+                        &knobs,
+                        Some(total_len),
+                        "Accept-Ranges absent",
+                    );
+                }
+                // Without the opt-in, preserve the historical refusal:
+                // the driver's correctness model (validate the
+                // Content-Range echo etc.) needs the server to
+                // actually satisfy range requests, and a HEAD that
+                // omits the hint is also far more likely to refuse.
                 return Err(Error::Unsupported(format!(
                     "HTTP HEAD {uri}: server did not advertise Accept-Ranges (RFC 9110 §14.3)"
                 )));
             }
         }
-        // Capture a STRONG validator per RFC 9110 §13.1.5 so subsequent
-        // range GETs can carry `If-Range: <validator>` and surface a
-        // mid-stream mutation cleanly. ETag takes precedence (§8.8.3
-        // is "more reliable for validation than a modification date"
-        // and the strong/weak distinction is grammatical); fall back to
-        // Last-Modified only when §8.8.2.2's "Date - Last-Modified >= 1s"
-        // rule promotes it from implicitly-weak to strong.
-        let etag_raw = headers
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim);
-        let last_modified = headers
-            .get("last-modified")
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim);
-        let date_hdr = headers
-            .get("date")
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim);
-        let validator = derive_strong_validator(etag_raw, last_modified, date_hdr);
-        // RFC 9110 §12.5.5: a `Vary` header reports the request fields
-        // the origin used to select this representation via proactive
-        // content negotiation (§12). The driver issues a HEAD, records
-        // `total_len`/`validator`, then satisfies reads with separate
-        // Range GETs — so it must know the representation it ranges over
-        // is the one the HEAD measured. The wildcard form is the unsafe
-        // case: §12.5.5 says it "signals that other aspects of the
-        // request might have played a role in selecting the response
-        // representation, possibly including aspects outside the message
-        // syntax (e.g., the client's network address)". The driver
-        // cannot reproduce such out-of-band aspects across requests, so
-        // a `Vary: *` resource may serve a *different* representation on
-        // the very next Range GET — with a different length the recorded
-        // `total_len` no longer describes, and different bytes a demuxer
-        // would silently misparse. The `If-Range` path (§13.1.5) catches
-        // exactly this kind of mid-stream divergence, but only when a
-        // strong validator exists to carry. So `Vary: *` is fatal *only*
-        // when no strong validator was captured; with one in hand, a
-        // representation swap re-materialises as the §13.1.5 200-fallback
-        // we already treat as a fatal mid-stream mutation in the GET
-        // path. The concrete-field-name form (§12.5.5 form 2) is always
-        // safe here: the driver sends a fixed, identical request header
-        // set on the HEAD and every Range GET, so negotiation that keys
-        // only on request fields lands on the same representation each
-        // time. Obs-fold is normalised before interpretation per RFC
-        // 7230 §3.2.4 (`Vary` is a §5.6.1 comma list, a plausible
-        // obs-fold target for older origins/proxies).
-        let vary_owned = headers
-            .get("vary")
-            .and_then(|v| v.to_str().ok())
-            .map(normalize_obs_fold);
-        if let Some(vary_raw) = vary_owned.as_deref() {
-            if parse_vary(vary_raw) == Vary::Wildcard && validator.is_none() {
-                return Err(Error::Unsupported(format!(
-                    "HTTP HEAD {uri}: response carries 'Vary: *' (RFC 9110 §12.5.5) with no \
-                     strong validator (ETag / promotable Last-Modified) — the origin warns the \
-                     representation may be selected on aspects outside the message syntax, so a \
-                     later Range GET could serve a different representation the driver cannot \
-                     detect (no If-Range guard per §13.1.5)"
-                )));
-            }
-        }
+        let validator = validator_with_vary_check(&format!("HTTP HEAD {uri}"), headers)?;
         Ok(Self {
             uri: uri.to_owned(),
             total_len,
@@ -679,6 +677,196 @@ impl HttpSource {
             validator,
             body: None,
             body_remaining: 0,
+            read_retries: knobs.read_retries(),
+            seek_drain_max: knobs.seek_drain_max(),
+        })
+    }
+
+    /// Learn the resource's metadata from a `Range: bytes=0-` GET
+    /// probe instead of a HEAD — the opt-in fallback behind
+    /// [`HttpConfig::range_probe`] for servers whose HEAD hand-shake
+    /// is inconclusive (405/501, missing Content-Length, or no
+    /// Accept-Ranges advertisement; RFC 9110 §15.5.6 / §15.6.2 /
+    /// §9.3.2 / §14.3 respectively).
+    ///
+    /// A 206 answer proves byte-range support directly; §14.4 makes
+    /// its Content-Range carry the complete-length, which replaces the
+    /// HEAD-provided total (`head_total`, when known from a HEAD that
+    /// succeeded but omitted Accept-Ranges, cross-checks it). The
+    /// probe body becomes the initial read stream, so a successful
+    /// probe costs no extra request. A 200 answer means the server
+    /// exercised §14.2's "A server MAY ignore the Range header field"
+    /// — useless for a seekable source, refused. A 416 with
+    /// `bytes */0` is the CORRECT answer for an empty resource
+    /// (§14.1.2: "When a selected representation has zero length, the
+    /// only satisfiable form of range-spec in a GET request is a
+    /// suffix-range with a non-zero suffix-length") and yields an
+    /// empty source.
+    fn probe_open(
+        uri: &str,
+        scoped: Option<Agent>,
+        knobs: &HttpConfig,
+        head_total: Option<u64>,
+        why: &str,
+    ) -> Result<Self> {
+        let probe_agent: &Agent = scoped.as_ref().unwrap_or_else(|| agent());
+        let resp = probe_agent
+            .get(uri)
+            .header("Range", "bytes=0-")
+            .header("Accept-Encoding", "identity")
+            .call()
+            .map_err(|e| Error::other(format!("HTTP GET probe {uri} ({why}): {e}")))?;
+        let status = resp.status();
+        if status == 416 {
+            let cr_raw = resp
+                .headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let Some(cr) = cr_raw.as_deref() else {
+                return Err(Error::other(format!(
+                    "HTTP GET probe {uri} ({why}): 416 without Content-Range (RFC 9110 §14.4 \
+                     SHOULD) — cannot distinguish an empty resource from a range refusal"
+                )));
+            };
+            return match parse_byte_unsatisfied_range(cr) {
+                // Zero-length representation: `bytes=0-` is
+                // unsatisfiable by §14.1.2, so this 416 is range
+                // support working correctly. No GET will ever be
+                // issued (pos >= total holds from the start), so no
+                // validator is needed.
+                Ok(0) => Ok(Self {
+                    uri: uri.to_owned(),
+                    total_len: 0,
+                    pos: 0,
+                    agent: scoped,
+                    validator: None,
+                    body: None,
+                    body_remaining: 0,
+                    read_retries: knobs.read_retries(),
+                    seek_drain_max: knobs.seek_drain_max(),
+                }),
+                Ok(c) => Err(Error::other(format!(
+                    "HTTP GET probe {uri} ({why}): 416 for 'bytes=0-' yet complete-length {c} \
+                     — first-pos 0 is satisfiable against any non-empty representation \
+                     (RFC 9110 §14.1.2)"
+                ))),
+                Err(e) => Err(Error::other(format!(
+                    "HTTP GET probe {uri} ({why}): 416 with invalid Content-Range '{cr}': {e}"
+                ))),
+            };
+        }
+        if status == 200 {
+            return Err(Error::Unsupported(format!(
+                "HTTP GET probe {uri} ({why}): server ignored 'Range: bytes=0-' and answered \
+                 200 (RFC 9110 §14.2: 'A server MAY ignore the Range header field') — a \
+                 seekable byte source requires 206 range satisfaction"
+            )));
+        }
+        if status != 206 {
+            let retry_msg = retry_after_hint_of(resp.headers());
+            return Err(Error::other(format!(
+                "HTTP GET probe {uri} ({why}): status {status}{retry_msg}"
+            )));
+        }
+        let headers = resp.headers();
+        // Same representation-integrity gauntlet as the HEAD path +
+        // the ranged-GET path: identity coding only (§8.4 / §12.5.3),
+        // no multipart to a single-range request (§15.3.7.2 MUST NOT).
+        let codings = non_identity_codings_in(headers);
+        if !codings.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "HTTP GET probe {uri} ({why}): representation carries Content-Encoding \
+                 {codings:?} despite 'Accept-Encoding: identity' (RFC 9110 §12.5.3); per §8.4 \
+                 the byte ranges then describe the coded form, which the driver does not decode"
+            )));
+        }
+        let ct_raw = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if is_multipart_byteranges_content_type(ct_raw) {
+            return Err(Error::other(format!(
+                "HTTP GET probe {uri} ({why}): multipart/byteranges to a single-range request \
+                 (RFC 9110 §15.3.7.2 MUST NOT). Content-Type: {ct_raw:?}"
+            )));
+        }
+        // §15.3.7.1: a single-part 206 MUST carry Content-Range; §14.4
+        // gives us the complete-length the HEAD never delivered.
+        let cr_raw = headers
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                Error::other(format!(
+                    "HTTP GET probe {uri} ({why}): 206 missing Content-Range \
+                     (RFC 9110 §15.3.7.1 MUST)"
+                ))
+            })?;
+        let parsed = parse_byte_content_range(&cr_raw).map_err(|e| {
+            Error::other(format!(
+                "HTTP GET probe {uri} ({why}): invalid Content-Range '{cr_raw}': {e}"
+            ))
+        })?;
+        if parsed.first != 0 {
+            return Err(Error::other(format!(
+                "HTTP GET probe {uri} ({why}): Content-Range first-byte-pos {} != requested 0",
+                parsed.first
+            )));
+        }
+        let total_len = match (parsed.complete, head_total) {
+            (Some(c), Some(t)) if c != t => {
+                return Err(Error::other(format!(
+                    "HTTP GET probe {uri} ({why}): Content-Range complete-length {c} != \
+                     HEAD-observed Content-Length {t} (RFC 9110 §8.6)"
+                )));
+            }
+            (Some(c), _) => c,
+            // The probe server used the §14.4 '*' form but a
+            // successful HEAD already measured the resource.
+            (None, Some(t)) => t,
+            (None, None) => {
+                return Err(Error::Unsupported(format!(
+                    "HTTP GET probe {uri} ({why}): Content-Range complete-length is '*' and no \
+                     HEAD measurement exists — §14.4 permits '*' when the total is unknown, but \
+                     a seekable source needs an authoritative length (SeekFrom::End, EOF)"
+                )));
+            }
+        };
+        if parsed.last >= total_len {
+            return Err(Error::other(format!(
+                "HTTP GET probe {uri} ({why}): Content-Range last-byte-pos {} >= total {total_len}",
+                parsed.last
+            )));
+        }
+        let span = parsed.last - parsed.first + 1;
+        // §8.6: a 206's Content-Length is the byte count of THIS
+        // message's content — for the single-part form, the span.
+        let cl = headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        if let Some(cl) = cl {
+            if cl != span {
+                return Err(Error::other(format!(
+                    "HTTP GET probe {uri} ({why}): Content-Length {cl} != Content-Range span \
+                     {span} (RFC 9110 §8.6)"
+                )));
+            }
+        }
+        let validator = validator_with_vary_check(&format!("HTTP GET probe {uri}"), headers)?;
+        // The probe response IS the first range response — hand its
+        // body to the read path (with span accounting) instead of
+        // discarding a perfectly good bytes 0-N transfer.
+        let reader: Box<dyn Read + Send> = Box::new(resp.into_body().into_reader());
+        Ok(Self {
+            uri: uri.to_owned(),
+            total_len,
+            pos: 0,
+            agent: scoped,
+            validator,
+            body: Some(reader),
+            body_remaining: span,
             read_retries: knobs.read_retries(),
             seek_drain_max: knobs.seek_drain_max(),
         })
@@ -2477,6 +2665,102 @@ fn derive_strong_validator(
     None
 }
 
+/// Walk every `Content-Encoding` field line of a response (the RFC
+/// 9110 §8.4 `#` list may be split across lines per §5.6.1), normalise
+/// obs-fold first (RFC 7230 §3.2.4), and collect every coding that is
+/// not the §12.5.3 `identity` "no encoding" synonym. A field value
+/// that cannot even be read as a string cannot name a coding we know
+/// how to leave alone — it is reported as an opaque placeholder so the
+/// caller fails toward rejection, never toward silent acceptance.
+fn non_identity_codings_in(headers: &ureq::http::HeaderMap) -> Vec<String> {
+    let mut codings: Vec<String> = Vec::new();
+    for v in headers.get_all("content-encoding") {
+        match v.to_str() {
+            Ok(s) => codings.extend(non_identity_content_codings(&normalize_obs_fold(s))),
+            Err(_) => codings.push("<non-ASCII content-coding>".to_owned()),
+        }
+    }
+    codings
+}
+
+/// Render the RFC 9110 §10.2.3 `Retry-After` hint (if any) of a
+/// non-success response for inclusion in an error message, with
+/// obs-fold normalised prior to interpretation (RFC 7230 §3.2.4).
+fn retry_after_hint_of(headers: &ureq::http::HeaderMap) -> String {
+    let retry_after = headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(normalize_obs_fold);
+    retry_after
+        .as_deref()
+        .map(format_retry_after_hint)
+        .unwrap_or_default()
+}
+
+/// Capture a STRONG validator per RFC 9110 §13.1.5 from a metadata
+/// response's headers, then run the §12.5.5 `Vary: *` stability check
+/// against it. Shared by the HEAD open path and the `bytes=0-` GET
+/// probe path; `ctx` names the request for error messages.
+///
+/// Validator: ETag takes precedence (§8.8.3 is "more reliable for
+/// validation than a modification date" and the strong/weak
+/// distinction is grammatical); fall back to Last-Modified only when
+/// §8.8.2.2's "Date - Last-Modified >= 1s" rule promotes it from
+/// implicitly-weak to strong.
+///
+/// Vary: §12.5.5's wildcard form "signals that other aspects of the
+/// request might have played a role in selecting the response
+/// representation, possibly including aspects outside the message
+/// syntax (e.g., the client's network address)". The driver cannot
+/// reproduce out-of-band aspects across requests, so a `Vary: *`
+/// resource may serve a *different* representation on the very next
+/// range GET — with a different length the recorded total no longer
+/// describes, and different bytes a demuxer would silently misparse.
+/// The §13.1.5 If-Range guard catches exactly this divergence, but
+/// only when a strong validator exists to carry — so `Vary: *` is
+/// fatal ONLY when no strong validator was captured. The
+/// concrete-field-name form (§12.5.5 form 2) is always safe here: the
+/// driver sends a fixed, identical request header set on the metadata
+/// request and every range GET, so negotiation keyed on request
+/// fields lands on the same representation each time. Obs-fold is
+/// normalised before interpretation per RFC 7230 §3.2.4 (`Vary` is a
+/// §5.6.1 comma list, a plausible obs-fold target for older
+/// origins/proxies).
+fn validator_with_vary_check(
+    ctx: &str,
+    headers: &ureq::http::HeaderMap,
+) -> Result<Option<StrongValidator>> {
+    let etag_raw = headers
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim);
+    let last_modified = headers
+        .get("last-modified")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim);
+    let date_hdr = headers
+        .get("date")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim);
+    let validator = derive_strong_validator(etag_raw, last_modified, date_hdr);
+    let vary_owned = headers
+        .get("vary")
+        .and_then(|v| v.to_str().ok())
+        .map(normalize_obs_fold);
+    if let Some(vary_raw) = vary_owned.as_deref() {
+        if parse_vary(vary_raw) == Vary::Wildcard && validator.is_none() {
+            return Err(Error::Unsupported(format!(
+                "{ctx}: response carries 'Vary: *' (RFC 9110 §12.5.5) with no \
+                 strong validator (ETag / promotable Last-Modified) — the origin warns the \
+                 representation may be selected on aspects outside the message syntax, so a \
+                 later Range GET could serve a different representation the driver cannot \
+                 detect (no If-Range guard per §13.1.5)"
+            )));
+        }
+    }
+    Ok(validator)
+}
+
 impl Read for HttpSource {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() {
@@ -3483,6 +3767,7 @@ mod tests {
         assert_eq!(c.timeout_connect(), None);
         assert_eq!(c.read_retries(), 2);
         assert_eq!(c.seek_drain_max(), 64 * 1024);
+        assert!(!c.range_probe());
     }
 
     #[test]
@@ -3497,6 +3782,7 @@ mod tests {
             .timeout_connect(Some(Duration::from_secs(5)))
             .read_retries(7)
             .seek_drain_max(123)
+            .range_probe(true)
             .build();
         assert_eq!(c.max_redirects(), 3);
         assert!(!c.max_redirects_will_error());
@@ -3507,6 +3793,7 @@ mod tests {
         assert_eq!(c.timeout_connect(), Some(Duration::from_secs(5)));
         assert_eq!(c.read_retries(), 7);
         assert_eq!(c.seek_drain_max(), 123);
+        assert!(c.range_probe());
     }
 
     #[test]
@@ -4394,6 +4681,238 @@ mod tests {
         assert_eq!(&rest, b"3456789");
         let log: Vec<String> = reqs.try_iter().collect();
         assert_eq!(log.len(), 3, "expected HEAD + 2 GETs, got {log:#?}");
+    }
+
+    // -- GET range-probe fallback (§15.5.6 / §15.6.2 / §9.3.2 / §14.3) -------
+
+    const HEAD_405: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\n\
+        Allow: GET\r\n\
+        Content-Length: 0\r\n\
+        Connection: close\r\n\
+        \r\n";
+
+    fn probe_cfg() -> HttpConfig {
+        HttpConfig::builder().range_probe(true).build()
+    }
+
+    #[test]
+    fn probe_disabled_head_405_stays_fatal() {
+        // Default config: no probing — a HEAD-hostile server is
+        // refused at open exactly as before, after a single request.
+        let (uri, reqs) = spawn_script_server(vec![HEAD_405.to_vec()]);
+        let err = HttpSource::open(&uri).err().expect("expected open to fail");
+        assert!(err.to_string().contains("status 405"), "wrong error: {err}");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 1, "no probe without the opt-in: {log:#?}");
+    }
+
+    #[test]
+    fn probe_after_head_405_learns_total_and_reuses_body() {
+        // §15.5.6: a 405 says the METHOD is unsupported, nothing about
+        // range support. The probe's 206 carries the complete-length
+        // (§14.4) and its body doubles as the initial read stream — so
+        // the whole open + full read costs exactly 2 requests.
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_405.to_vec(),
+            make_get_206("bytes 0-9/10", b"0123456789"),
+        ]);
+        let mut src = HttpSource::open_with_config(&uri, &probe_cfg()).expect("open");
+        assert_eq!(src.len(), 10);
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 2, "probe body must be reused: {log:#?}");
+        assert!(
+            log[1].to_ascii_lowercase().contains("range: bytes=0-"),
+            "probe must be a ranged GET: {:?}",
+            log[1]
+        );
+    }
+
+    #[test]
+    fn probe_after_head_without_content_length() {
+        // §9.3.2: "a server MAY omit header fields for which a value
+        // is determined only while generating the content" — its
+        // worked example names Content-Length on HEAD. The probe's
+        // Content-Range supplies the total instead.
+        static HEAD_NO_CL: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Accept-Ranges: bytes\r\n\
+            Connection: close\r\n\
+            \r\n";
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_NO_CL.to_vec(),
+            make_get_206("bytes 0-9/10", b"0123456789"),
+        ]);
+        let mut src = HttpSource::open_with_config(&uri, &probe_cfg()).expect("open");
+        assert_eq!(src.len(), 10);
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 2, "expected HEAD + probe GET, got {log:#?}");
+    }
+
+    #[test]
+    fn probe_after_absent_accept_ranges_cross_checks_head_total() {
+        // §14.3: "A client MAY generate range requests regardless of
+        // having received an Accept-Ranges field." HEAD measured 10
+        // bytes; the probe's complete-length must agree.
+        static HEAD_NO_AR: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 10\r\n\
+            Connection: close\r\n\
+            \r\n";
+        let (uri, _reqs) = spawn_script_server(vec![
+            HEAD_NO_AR.to_vec(),
+            make_get_206("bytes 0-9/10", b"0123456789"),
+        ]);
+        let mut src = HttpSource::open_with_config(&uri, &probe_cfg()).expect("open");
+        assert_eq!(src.len(), 10);
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+
+        // Disagreement is a §8.6 violation — refuse.
+        let (uri2, _reqs2) = spawn_script_server(vec![
+            HEAD_NO_AR.to_vec(),
+            make_get_206("bytes 0-19/20", b"0123456789abcdefghij"),
+        ]);
+        let err = HttpSource::open_with_config(&uri2, &probe_cfg())
+            .err()
+            .expect("expected open to fail");
+        assert!(
+            err.to_string().contains("complete-length 20"),
+            "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn probe_200_answer_is_unsupported() {
+        // §14.2: "A server MAY ignore the Range header field." A 200
+        // to the probe means it did — the resource is readable but not
+        // seekable, so the driver refuses it.
+        static GET_200: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            0123456789";
+        let (uri, _reqs) = spawn_script_server(vec![HEAD_405.to_vec(), GET_200.to_vec()]);
+        let err = HttpSource::open_with_config(&uri, &probe_cfg())
+            .err()
+            .expect("expected open to fail");
+        assert!(err.to_string().contains("ignored"), "wrong error: {err}");
+    }
+
+    #[test]
+    fn probe_star_complete_without_head_total_is_unsupported() {
+        // §14.4 permits `*` for an unknown complete-length, but with
+        // no successful HEAD either, nothing authoritative anchors
+        // SeekFrom::End — refuse rather than guess.
+        let (uri, _reqs) = spawn_script_server(vec![
+            HEAD_405.to_vec(),
+            make_get_206("bytes 0-9/*", b"0123456789"),
+        ]);
+        let err = HttpSource::open_with_config(&uri, &probe_cfg())
+            .err()
+            .expect("expected open to fail");
+        assert!(
+            err.to_string().contains("complete-length is '*'"),
+            "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn probe_star_complete_with_head_total_is_accepted() {
+        // HEAD succeeded (10 bytes) but omitted Accept-Ranges; the
+        // probe 206 uses the `*` form. The HEAD measurement anchors
+        // the total.
+        static HEAD_NO_AR: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 10\r\n\
+            Connection: close\r\n\
+            \r\n";
+        let (uri, _reqs) = spawn_script_server(vec![
+            HEAD_NO_AR.to_vec(),
+            make_get_206("bytes 0-9/*", b"0123456789"),
+        ]);
+        let mut src = HttpSource::open_with_config(&uri, &probe_cfg()).expect("open");
+        assert_eq!(src.len(), 10);
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+    }
+
+    #[test]
+    fn probe_416_zero_complete_is_empty_source() {
+        // §14.1.2: "When a selected representation has zero length,
+        // the only satisfiable form of range-spec in a GET request is
+        // a suffix-range with a non-zero suffix-length" — so 416 with
+        // `bytes */0` (§14.4) is range support working CORRECTLY on an
+        // empty resource.
+        static GET_416_EMPTY: &[u8] = b"HTTP/1.1 416 Range Not Satisfiable\r\n\
+            Content-Range: bytes */0\r\n\
+            Content-Length: 0\r\n\
+            Connection: close\r\n\
+            \r\n";
+        let (uri, reqs) = spawn_script_server(vec![HEAD_405.to_vec(), GET_416_EMPTY.to_vec()]);
+        let mut src = HttpSource::open_with_config(&uri, &probe_cfg()).expect("open");
+        assert_eq!(src.len(), 0);
+        assert!(src.is_empty());
+        let mut buf = [0u8; 4];
+        let n = std::io::Read::read(&mut src, &mut buf).expect("read");
+        assert_eq!(n, 0, "empty resource reads as immediate EOF");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 2, "EOF must not touch the wire: {log:#?}");
+    }
+
+    #[test]
+    fn probe_416_nonzero_complete_is_error() {
+        // A 416 claiming complete-length 5 contradicts itself:
+        // first-pos 0 is satisfiable against any non-empty
+        // representation (§14.1.2).
+        static GET_416_5: &[u8] = b"HTTP/1.1 416 Range Not Satisfiable\r\n\
+            Content-Range: bytes */5\r\n\
+            Content-Length: 0\r\n\
+            Connection: close\r\n\
+            \r\n";
+        let (uri, _reqs) = spawn_script_server(vec![HEAD_405.to_vec(), GET_416_5.to_vec()]);
+        let err = HttpSource::open_with_config(&uri, &probe_cfg())
+            .err()
+            .expect("expected open to fail");
+        assert!(
+            err.to_string().contains("satisfiable"),
+            "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn probe_captured_validator_guards_resume() {
+        // The probe response's ETag must feed the same §13.1.5
+        // machinery as a HEAD's: when the probe body is truncated, the
+        // resume GET carries If-Range with the probe-captured
+        // validator.
+        let mut probe_206 = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            ETag: \"v1\"\r\n\
+            Connection: close\r\n\
+            \r\n"
+            .to_vec();
+        probe_206.extend_from_slice(b"0123");
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_405.to_vec(),
+            probe_206,
+            make_get_206("bytes 4-9/10", b"456789"),
+        ]);
+        let mut src = HttpSource::open_with_config(&uri, &probe_cfg()).expect("open");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 3, "expected HEAD + probe + resume, got {log:#?}");
+        assert!(
+            log[2].to_ascii_lowercase().contains("if-range: \"v1\""),
+            "resume must carry the probe-captured validator: {:?}",
+            log[2]
+        );
     }
 
     // -- RFC 9110 §13.1.5 If-Range strong-validator path ---------------------

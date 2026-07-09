@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Opt-in GET range-probe fallback for HEAD-hostile servers — new
+  `HttpConfig::range_probe` knob (builder `range_probe(true)`, default
+  `false` keeps the historical refusals). When HEAD answers 405/501
+  (RFC 9110 §15.5.6 / §15.6.2), omits Content-Length (§9.3.2 permits
+  omitting fields "determined only while generating the content"), or
+  carries no `Accept-Ranges` (§14.3: "A client MAY generate range
+  requests regardless"), the driver probes with `Range: bytes=0-`. A
+  206 proves support: its Content-Range complete-length (§14.4)
+  supplies the total (cross-checked against a successful HEAD's
+  Content-Length; the `*` form is accepted only when HEAD measured the
+  resource), the §13.1.5 validator and §12.5.5 `Vary: *` check run on
+  the probe's headers, and the probe body becomes the initial read
+  stream so a successful probe costs no extra request. A 200 (§14.2
+  "A server MAY ignore the Range header field") is refused as
+  unseekable; a 416 carrying `bytes */0` yields an empty source
+  (§14.1.2 makes `bytes=0-` unsatisfiable against a zero-length
+  representation).
+
+### Changed
+
+- The HEAD path's Content-Encoding walk, Retry-After hint rendering,
+  and validator + `Vary: *` stability check are now shared helpers
+  reused verbatim by the probe path (`non_identity_codings_in`,
+  `retry_after_hint_of`, `validator_with_vary_check`); error message
+  texts are unchanged.
+
 - Forward-seek drain: a forward seek of at most
   `HttpConfig::seek_drain_max` bytes (builder `seek_drain_max(n)`,
   default 64 KiB, `0` restores always-reissue) that stays inside the
