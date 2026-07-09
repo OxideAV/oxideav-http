@@ -43,6 +43,9 @@ let cfg = HttpConfig::builder()
     .https_only(true)
     .timeout_connect(Some(Duration::from_secs(5)))
     .timeout_global(Some(Duration::from_secs(60)))
+    .read_retries(2)            // §14.2 transparent resume budget per read
+    .seek_drain_max(64 * 1024)  // forward hops this short drain the live body
+    .range_probe(false)         // opt-in GET probe for HEAD-hostile servers
     .build();
 
 // (A) install once at startup so every registry-dispatched open()
@@ -119,6 +122,74 @@ If a server ignores the `Range` header and responds with `200 OK`
 plus the full body (§3.1 permits this), the prefix `[0, self.pos)`
 is drained in 8 KiB chunks before bytes reach the reader, so the
 demuxer's file-offset view stays consistent.
+
+## Span accounting + transparent resume (RFC 9110 §15.3.7 + §14.2)
+
+Every response body is read against the span it *declared* — the
+`Content-Range` span on a 206, the post-prefix-drain remainder on a
+200 fallback:
+
+- Bytes beyond the declared span never reach the reader, even under
+  close-delimited framing (RFC 9112 §6.3 option 8) where the
+  transport would happily keep going. §15.3.7 makes the 206
+  self-descriptive; the span is the truth, not the connection state.
+- A server that satisfies only *part* of the open-ended range —
+  explicitly permitted by §15.3.7 / §14.2 — is followed up with
+  `Range: bytes=<new-pos>-` for the remainder, invisibly to the
+  caller.
+- EOF (or a connection reset / abort / broken pipe) *before* the
+  declared span is delivered is a partially failed transfer; §14.2
+  names recovery from exactly this as byte ranges' reason to exist.
+  The driver re-requests `bytes=<pos>-` and splices the remainder, up
+  to `read_retries` times per `read` call (default 2; `0` disables —
+  the first truncation then surfaces as `UnexpectedEof` naming the
+  missing byte count). Forward progress resets the budget. The resume
+  GET carries `If-Range` whenever a strong validator exists, so a
+  representation mutated between drop and resume is refused
+  (§13.1.5), never spliced onto already-delivered bytes. Non-transport
+  failures (416, metadata mismatches, the If-Range 200-fallback) are
+  never retried.
+
+## Seek-via-Range + forward-seek drain
+
+`Seek` maps onto `Range: bytes=<target>-` re-issues, with one economy:
+a forward hop of at most `seek_drain_max` bytes (default 64 KiB) that
+stays inside the live body's declared span drains the open connection
+instead of dropping it — a demuxer that alternates tiny header reads
+with small payload skips rides a single ranged GET for the whole walk.
+Backward seeks, hops past the cap or the span, and drains that hit a
+transport fault fall back to the re-issue path (`seek` itself never
+errors on a transport fault). Seeking past the HEAD-observed total is
+refused client-side with `InvalidInput`; positioning at EOF and
+reading costs no request at all.
+
+## HEAD-hostile servers: GET range probe (opt-in, RFC 9110 §14.3)
+
+Some origins answer `HEAD` with 405/501 (§15.5.6 / §15.6.2 — a verdict
+on the *method*, not on range support), omit `Content-Length` on HEAD
+(§9.3.2 explicitly permits omitting fields "determined only while
+generating the content"), or simply never send `Accept-Ranges` (§14.3
+keeps the header advisory: "A client MAY generate range requests
+regardless"). With `range_probe(true)` the driver falls back to a
+`Range: bytes=0-` GET in those three cases instead of refusing:
+
+- A **206** proves range support directly. Its `Content-Range`
+  complete-length (§14.4) supplies the total — cross-checked against
+  a successful HEAD's `Content-Length` (§8.6), with the `*` form
+  accepted only when a HEAD measured the resource. The §13.1.5
+  validator capture and §12.5.5 `Vary: *` stability check run on the
+  probe's own headers, and the probe body becomes the initial read
+  stream, so a successful probe costs **no extra request**.
+- A **200** means the server exercised §14.2's "A server MAY ignore
+  the Range header field" — refused as unseekable.
+- A **416** carrying `bytes */0` yields an empty source: §14.1.2
+  makes `bytes=0-` unsatisfiable against a zero-length
+  representation, so that 416 is range support working *correctly*.
+  Any non-zero complete-length on a 416 to `bytes=0-` is
+  self-contradictory and refused.
+
+Default `false`: without the opt-in, all three cases keep their
+historical refusal messages.
 
 ## 416 Range Not Satisfiable
 

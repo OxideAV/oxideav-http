@@ -4683,6 +4683,79 @@ mod tests {
         assert_eq!(log.len(), 3, "expected HEAD + 2 GETs, got {log:#?}");
     }
 
+    // -- EOF / bounds edges: no wasted wire ----------------------------------
+
+    const HEAD_0B_BYTES: &[u8] = b"HTTP/1.1 200 OK\r\n\
+        Content-Length: 0\r\n\
+        Accept-Ranges: bytes\r\n\
+        Connection: close\r\n\
+        \r\n";
+
+    #[test]
+    fn local_server_zero_length_resource_reads_eof_without_get() {
+        // A zero-length representation admits no satisfiable
+        // `bytes=N-` range at all (RFC 9110 §14.1.2), so the driver
+        // must answer every read with EOF from the HEAD metadata alone
+        // — issuing a range GET would only harvest a 416.
+        let (uri, reqs) = spawn_script_server(vec![HEAD_0B_BYTES.to_vec()]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        assert_eq!(src.len(), 0);
+        assert!(src.is_empty());
+        let mut buf = [0u8; 8];
+        assert_eq!(std::io::Read::read(&mut src, &mut buf).expect("read"), 0);
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 1, "EOF must not touch the wire: {log:#?}");
+    }
+
+    #[test]
+    fn local_server_seek_to_end_and_past_end_edges() {
+        // SeekFrom::End(0) positions at EOF: reads yield 0 without a
+        // request. Seeking past the HEAD-observed total is refused
+        // client-side (InvalidInput), again without a request.
+        let (uri, reqs) = spawn_script_server(vec![HEAD_10B_BYTES.to_vec()]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        assert_eq!(
+            std::io::Seek::seek(&mut src, SeekFrom::End(0)).expect("seek"),
+            10
+        );
+        let mut buf = [0u8; 4];
+        assert_eq!(std::io::Read::read(&mut src, &mut buf).expect("read"), 0);
+        let err = std::io::Seek::seek(&mut src, SeekFrom::Start(11))
+            .expect_err("expected seek past end to fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "wrong kind: {err}");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 1, "EOF/bounds handling is wire-free: {log:#?}");
+    }
+
+    #[test]
+    fn local_server_empty_read_buffer_touches_no_wire() {
+        let (uri, reqs) = spawn_script_server(vec![HEAD_10B_BYTES.to_vec()]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        assert_eq!(std::io::Read::read(&mut src, &mut []).expect("read"), 0);
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 1, "empty buffer must not open a body: {log:#?}");
+    }
+
+    #[test]
+    fn local_server_consecutive_drain_hops_share_one_get() {
+        // Demuxer-shaped access: read a header byte, skip a payload,
+        // repeat. Every hop fits the drain cap and the live span, so
+        // the whole walk must ride ONE ranged GET.
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_10B_BYTES.to_vec(),
+            make_get_206("bytes 0-9/10", b"0123456789"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut one = [0u8; 1];
+        for expected in [b'0', b'3', b'6'] {
+            std::io::Read::read_exact(&mut src, &mut one).expect("read");
+            assert_eq!(one[0], expected);
+            std::io::Seek::seek(&mut src, SeekFrom::Current(2)).expect("seek");
+        }
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 2, "hop-walk must share one GET: {log:#?}");
+    }
+
     // -- GET range-probe fallback (§15.5.6 / §15.6.2 / §9.3.2 / §14.3) -------
 
     const HEAD_405: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\n\
