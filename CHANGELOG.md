@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Transparent resume after mid-body transport drops (RFC 9110 §14.2:
+  byte ranges "support efficient recovery from partially failed
+  transfers"). A truncated body or a transport-shaped read error
+  (unexpected EOF / connection reset / abort / broken pipe) now
+  re-requests `Range: bytes=<pos>-` and splices the remainder, up to a
+  configurable per-`read`-call budget — new `HttpConfig::read_retries`
+  knob (builder `read_retries(n)`, default 2, `0` disables). The
+  resume GET carries `If-Range` whenever a strong validator exists, so
+  a representation mutated between drop and resume is refused
+  (§13.1.5), never spliced; non-transport failures (416, metadata
+  mismatches, the If-Range 200-fallback) are never retried.
+
 - RFC 9110 §15.3.7 span accounting on the read path. The driver now
   records the byte span each response promises (the Content-Range span
   on a 206; the post-prefix-drain remainder on a RFC 7233 §3.1

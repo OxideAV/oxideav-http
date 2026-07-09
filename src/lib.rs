@@ -50,6 +50,17 @@
 //! driver treats the latter as a fatal mid-stream-mutation error
 //! rather than silently re-anchoring the byte offset against a
 //! different resource.
+//!
+//! ## Transparent resume after transport drops (RFC 9110 §14.2)
+//!
+//! §14.2 motivates byte ranges with "efficient recovery from partially
+//! failed transfers": when a response body is truncated or the
+//! connection drops mid-stream, the driver re-requests
+//! `Range: bytes=<current-pos>-` and splices the remainder — up to
+//! [`HttpConfigBuilder::read_retries`] times per `read` call (default
+//! 2, `0` disables). The resume GET carries `If-Range` whenever a
+//! strong validator exists, so a representation that mutated between
+//! the drop and the resume is refused (§13.1.5), never spliced.
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::OnceLock;
@@ -129,6 +140,7 @@ pub struct HttpConfig {
     https_only: bool,
     timeout_global: Option<Duration>,
     timeout_connect: Option<Duration>,
+    read_retries: u32,
 }
 
 impl Default for HttpConfig {
@@ -145,6 +157,7 @@ impl Default for HttpConfig {
             https_only: false,
             timeout_global: None,
             timeout_connect: None,
+            read_retries: 2,
         }
     }
 }
@@ -193,6 +206,15 @@ impl HttpConfig {
     /// Maximum time to establish a connection (TCP + TLS handshake).
     pub fn timeout_connect(&self) -> Option<Duration> {
         self.timeout_connect
+    }
+
+    /// Maximum number of transparent range re-requests a single `read`
+    /// call may issue after a mid-body transport drop or truncation
+    /// (RFC 9110 §14.2: byte ranges "support efficient recovery from
+    /// partially failed transfers"). Default 2. `0` disables resume:
+    /// the first truncation surfaces as an error.
+    pub fn read_retries(&self) -> u32 {
+        self.read_retries
     }
 }
 
@@ -246,6 +268,15 @@ impl HttpConfigBuilder {
     /// Connect timeout (TCP + TLS handshake). None = unlimited.
     pub fn timeout_connect(mut self, d: Option<Duration>) -> Self {
         self.inner.timeout_connect = d;
+        self
+    }
+
+    /// Cap the transparent mid-body resume re-requests per `read` call
+    /// (RFC 9110 §14.2 partial-transfer recovery). Default 2; `0`
+    /// surfaces the first transport truncation as an error instead of
+    /// re-requesting the remainder.
+    pub fn read_retries(mut self, n: u32) -> Self {
+        self.inner.read_retries = n;
         self
     }
 
@@ -377,6 +408,9 @@ pub struct HttpSource {
     /// (RFC 7233 §3.1) it is the remainder of the representation after
     /// the prefix drain. Meaningful only while `body` is `Some`.
     body_remaining: u64,
+    /// Transparent mid-body resume budget per `read` call — see
+    /// [`HttpConfig::read_retries`].
+    read_retries: u32,
 }
 
 impl HttpSource {
@@ -395,10 +429,18 @@ impl HttpSource {
     /// when it goes out of scope; the process-wide default agent is
     /// unaffected.
     pub fn open_with_config(uri: &str, cfg: &HttpConfig) -> Result<Self> {
-        Self::open_impl(uri, Some(agent_from(cfg)))
+        Self::open_impl(uri, Some(cfg))
     }
 
-    fn open_impl(uri: &str, scoped: Option<Agent>) -> Result<Self> {
+    fn open_impl(uri: &str, cfg: Option<&HttpConfig>) -> Result<Self> {
+        let scoped: Option<Agent> = cfg.map(agent_from);
+        // Driver-behaviour knobs (as opposed to agent-construction
+        // knobs) are resolved per open: a scoped config wins, else the
+        // installed process-wide default, else the library defaults.
+        let knobs: HttpConfig = cfg
+            .cloned()
+            .or_else(|| DEFAULT_CONFIG.get().cloned())
+            .unwrap_or_default();
         let head_agent: &Agent = scoped.as_ref().unwrap_or_else(|| agent());
         // RFC 9110 §12.5.3 rule 1: "If no Accept-Encoding header field
         // is in the request, any content coding is considered
@@ -602,6 +644,7 @@ impl HttpSource {
             validator,
             body: None,
             body_remaining: 0,
+            read_retries: knobs.read_retries(),
         })
     }
 
@@ -2378,6 +2421,15 @@ impl Read for HttpSource {
         if self.pos >= self.total_len {
             return Ok(0);
         }
+        // Transparent-resume budget for THIS call (RFC 9110 §14.2:
+        // byte ranges "support efficient recovery from partially
+        // failed transfers" — the recovery is a fresh `Range:
+        // bytes=<pos>-` GET, guarded by `If-Range` when a strong
+        // validator exists so a mutated representation cannot be
+        // silently spliced onto the old bytes; §13.1.5). Any
+        // successful read returns from the loop, so the budget
+        // naturally resets once forward progress is made.
+        let mut attempts: u32 = 0;
         loop {
             if self.body.is_none() {
                 self.issue_range()?;
@@ -2401,38 +2453,73 @@ impl Read for HttpSource {
                 // portion of the requested ranges first, while
                 // expecting the client to re-request the remaining
                 // portions later"). Issue the follow-up range from the
-                // new position.
+                // new position. This is NOT a resume retry — the span
+                // was fully delivered — so the budget is untouched.
                 self.body = None;
                 continue;
             }
-            let n = body.read(&mut out[..want])?;
-            if n > 0 {
-                self.pos += n as u64;
-                self.body_remaining -= n as u64;
-                return Ok(n);
-            }
-            // EOF before the declared span was delivered. The old
-            // behaviour silently re-issued the range; against a server
-            // that repeatedly sends a valid 206 header block followed
-            // by an empty/short body that degenerates into an infinite
-            // request storm with zero forward progress. Surface it as
-            // the transport truncation it is (§8.6: the message body
-            // length is part of the message's self-description; a body
-            // shorter than the declared span means the message was
-            // incomplete).
+            let truncation = match body.read(&mut out[..want]) {
+                Ok(n) if n > 0 => {
+                    self.pos += n as u64;
+                    self.body_remaining -= n as u64;
+                    return Ok(n);
+                }
+                // EOF before the declared span was delivered (§8.6:
+                // the declared length is part of the message's
+                // self-description; a shorter body means the message
+                // was incomplete).
+                Ok(_) => None,
+                // A transport-shaped failure mid-body (peer reset /
+                // drop) is the exact partially-failed-transfer case
+                // §14.2 designed byte ranges to recover from.
+                // Anything else (invalid data, interrupted-by-caller
+                // semantics, timeout policy) is not ours to paper
+                // over — propagate.
+                Err(e) if is_transient_read_error(e.kind()) => Some(e),
+                Err(e) => return Err(e),
+            };
             self.body = None;
             let missing = self.body_remaining;
             self.body_remaining = 0;
+            if attempts < self.read_retries {
+                // Resume: the next loop turn re-issues
+                // `Range: bytes=<pos>-` (+ `If-Range` when we hold a
+                // strong validator). `issue_range` failures — 416,
+                // the §13.1.5 If-Range 200-fallback (mid-stream
+                // mutation), metadata mismatches — stay fatal; only
+                // the transport layer gets second chances.
+                attempts += 1;
+                continue;
+            }
+            let via = match truncation {
+                Some(e) => format!(" ({e})"),
+                None => String::new(),
+            };
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 format!(
-                    "HTTP GET {}: body truncated at pos {} — {missing} byte(s) of the \
-                     declared span still owed (RFC 9110 §15.3.7 Content-Range span / §8.6)",
+                    "HTTP GET {}: body truncated at pos {}{via} — {missing} byte(s) of the \
+                     declared span still owed after {attempts} transparent re-request(s) \
+                     (RFC 9110 §15.3.7 Content-Range span / §8.6 / §14.2 recovery)",
                     self.uri, self.pos
                 ),
             ));
         }
     }
+}
+
+/// Errors on the body stream that plausibly mean "the transfer
+/// partially failed" (RFC 9110 §14.2) rather than "the data is bad" —
+/// the only class the read path is willing to transparently resume
+/// across with a fresh range request.
+fn is_transient_read_error(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+    )
 }
 
 impl Seek for HttpSource {
@@ -3310,6 +3397,7 @@ mod tests {
         assert!(!c.https_only());
         assert_eq!(c.timeout_global(), None);
         assert_eq!(c.timeout_connect(), None);
+        assert_eq!(c.read_retries(), 2);
     }
 
     #[test]
@@ -3322,6 +3410,7 @@ mod tests {
             .https_only(true)
             .timeout_global(Some(Duration::from_secs(30)))
             .timeout_connect(Some(Duration::from_secs(5)))
+            .read_retries(7)
             .build();
         assert_eq!(c.max_redirects(), 3);
         assert!(!c.max_redirects_will_error());
@@ -3330,6 +3419,7 @@ mod tests {
         assert!(c.https_only());
         assert_eq!(c.timeout_global(), Some(Duration::from_secs(30)));
         assert_eq!(c.timeout_connect(), Some(Duration::from_secs(5)));
+        assert_eq!(c.read_retries(), 7);
     }
 
     #[test]
@@ -3883,15 +3973,17 @@ mod tests {
         // only 4 body bytes before the connection closes. §8.6 makes
         // the declared span part of the message's self-description —
         // EOF before the span is delivered is a truncated message, not
-        // a clean end-of-body.
+        // a clean end-of-body. Resume disabled (`read_retries(0)`) so
+        // the FIRST truncation must surface as the error.
         let mut get = b"HTTP/1.1 206 Partial Content\r\n\
             Content-Range: bytes 0-9/10\r\n\
             Connection: close\r\n\
             \r\n"
             .to_vec();
         get.extend_from_slice(b"0123");
-        let (uri, _reqs) = spawn_script_server(vec![HEAD_10B_BYTES.to_vec(), get]);
-        let mut src = HttpSource::open(&uri).expect("open");
+        let (uri, reqs) = spawn_script_server(vec![HEAD_10B_BYTES.to_vec(), get]);
+        let cfg = HttpConfig::builder().read_retries(0).build();
+        let mut src = HttpSource::open_with_config(&uri, &cfg).expect("open");
         let mut buf = [0u8; 10];
         let err = std::io::Read::read_exact(&mut src, &mut buf).unwrap_err();
         assert_eq!(
@@ -3900,6 +3992,12 @@ mod tests {
             "wrong kind: {err}"
         );
         assert!(err.to_string().contains("truncated"), "wrong error: {err}");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(
+            log.len(),
+            2,
+            "read_retries(0) must not re-issue the range: {log:#?}"
+        );
     }
 
     #[test]
@@ -3907,8 +4005,9 @@ mod tests {
         // A server that repeatedly answers a valid 206 header block
         // followed by an immediately-closed, empty body used to spin
         // the read loop into an unbounded GET storm (re-issue on EOF,
-        // zero forward progress each time). The span accounting must
-        // surface it as one truncation error after ONE ranged GET.
+        // zero forward progress each time). With the default resume
+        // budget of 2 (§14.2 recovery), the read must give up after
+        // exactly 1 + 2 ranged GETs and surface one truncation error.
         let empty_206 = b"HTTP/1.1 206 Partial Content\r\n\
             Content-Range: bytes 0-9/10\r\n\
             Connection: close\r\n\
@@ -3916,6 +4015,7 @@ mod tests {
             .to_vec();
         let (uri, reqs) = spawn_script_server(vec![
             HEAD_10B_BYTES.to_vec(),
+            empty_206.clone(),
             empty_206.clone(),
             empty_206.clone(),
             empty_206,
@@ -3928,12 +4028,147 @@ mod tests {
             io::ErrorKind::UnexpectedEof,
             "wrong kind: {err}"
         );
+        assert!(
+            err.to_string().contains("after 2 transparent re-request"),
+            "error must name the exhausted budget: {err}"
+        );
         let log: Vec<String> = reqs.try_iter().collect();
         assert_eq!(
             log.len(),
-            2,
-            "zero-progress truncation must not re-issue the range: {log:#?}"
+            4,
+            "expected HEAD + initial GET + 2 resume GETs, got {log:#?}"
         );
+    }
+
+    // -- RFC 9110 §14.2 transparent resume after transport drops -------------
+
+    const HEAD_10B_BYTES_ETAG: &[u8] = b"HTTP/1.1 200 OK\r\n\
+        Content-Length: 10\r\n\
+        Accept-Ranges: bytes\r\n\
+        ETag: \"v1\"\r\n\
+        Connection: close\r\n\
+        \r\n";
+
+    /// A close-delimited 206 covering `bytes 0-9/10` that delivers only
+    /// the first 4 body bytes before the connection closes.
+    fn truncated_206_prefix() -> Vec<u8> {
+        let mut get = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n"
+            .to_vec();
+        get.extend_from_slice(b"0123");
+        get
+    }
+
+    #[test]
+    fn local_server_resume_after_truncation_completes_read() {
+        // §14.2: byte ranges "support efficient recovery from
+        // partially failed transfers". The first GET is truncated
+        // after 4 of 10 declared bytes; the driver must re-request
+        // `bytes=4-` and splice the remainder seamlessly.
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_10B_BYTES.to_vec(),
+            truncated_206_prefix(),
+            make_get_206("bytes 4-9/10", b"456789"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 3, "expected HEAD + 2 GETs, got {log:#?}");
+        assert!(
+            log[2].to_ascii_lowercase().contains("range: bytes=4-"),
+            "resume GET must start at the truncation point: {:?}",
+            log[2]
+        );
+    }
+
+    #[test]
+    fn local_server_resume_carries_if_range_validator() {
+        // §13.1.5: the resume GET must carry the strong validator
+        // captured at HEAD so a representation mutated between the
+        // drop and the resume cannot be silently spliced onto the
+        // bytes already delivered.
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_10B_BYTES_ETAG.to_vec(),
+            truncated_206_prefix(),
+            make_get_206("bytes 4-9/10", b"456789"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 3, "expected HEAD + 2 GETs, got {log:#?}");
+        assert!(
+            log[2].to_ascii_lowercase().contains("if-range: \"v1\""),
+            "resume GET must carry If-Range: {:?}",
+            log[2]
+        );
+    }
+
+    #[test]
+    fn local_server_mutation_during_resume_is_fatal() {
+        // The §13.1.5 guard in action across a resume: the server
+        // answers the resume GET (which carries If-Range) with a 200 —
+        // meaning the validator no longer matches and the
+        // representation was replaced mid-stream. Splicing the new
+        // bytes after the 4 old ones would hand the demuxer a chimera;
+        // the driver must fail loudly instead, and must NOT spend
+        // further resume budget on a non-transport error.
+        static GET_200_NEW: &[u8] = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 10\r\n\
+            Connection: close\r\n\
+            \r\n\
+            ABCDEFGHIJ";
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_10B_BYTES_ETAG.to_vec(),
+            truncated_206_prefix(),
+            GET_200_NEW.to_vec(),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        let err = std::io::Read::read_exact(&mut src, &mut buf).unwrap_err();
+        assert!(
+            err.to_string().contains("If-Range validator did not match"),
+            "wrong error: {err}"
+        );
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(
+            log.len(),
+            3,
+            "a §13.1.5 mutation is fatal, not retryable: {log:#?}"
+        );
+    }
+
+    #[test]
+    fn local_server_resume_after_content_length_framed_drop() {
+        // Same drop, but the truncated response is Content-Length
+        // framed (RFC 9112 §6.3 option 5): the transport layer itself
+        // notices the short body and surfaces an error rather than a
+        // clean EOF. That error is transport-shaped, so the §14.2
+        // resume path must treat it exactly like the close-framed
+        // truncation and re-request `bytes=4-`.
+        let mut get1 = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Length: 10\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n"
+            .to_vec();
+        get1.extend_from_slice(b"0123");
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_10B_BYTES.to_vec(),
+            get1,
+            make_get_206("bytes 4-9/10", b"456789"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 3, "expected HEAD + 2 GETs, got {log:#?}");
     }
 
     // -- RFC 9110 §13.1.5 If-Range strong-validator path ---------------------
