@@ -5099,6 +5099,28 @@ mod tests {
     }
 
     #[test]
+    fn probe_503_surfaces_retry_after_hint() {
+        // The probe's non-success path shares the HEAD path's RFC 9110
+        // §10.2.3 Retry-After surfacing, so a caller wiring back-off
+        // gets the parsed delay without re-fishing the header.
+        static GET_503: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\
+            Retry-After: 120\r\n\
+            Content-Length: 0\r\n\
+            Connection: close\r\n\
+            \r\n";
+        let (uri, _reqs) = spawn_script_server(vec![HEAD_405.to_vec(), GET_503.to_vec()]);
+        let err = HttpSource::open_with_config(&uri, &probe_cfg())
+            .err()
+            .expect("expected open to fail");
+        let msg = err.to_string();
+        assert!(msg.contains("status 503"), "wrong error: {msg}");
+        assert!(
+            msg.contains("(Retry-After: 120 s)"),
+            "missing §10.2.3 hint: {msg}"
+        );
+    }
+
+    #[test]
     fn probe_captured_validator_guards_resume() {
         // The probe response's ETag must feed the same §13.1.5
         // machinery as a HEAD's: when the probe body is truncated, the
