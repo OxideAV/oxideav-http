@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- RFC 9110 §15.3.7 span accounting on the read path. The driver now
+  records the byte span each response promises (the Content-Range span
+  on a 206; the post-prefix-drain remainder on a RFC 7233 §3.1
+  200-fallback) and (a) never reads past it — a close-delimited body
+  (RFC 9112 §6.3 option 8) carrying junk beyond the declared span can
+  no longer skew the reader's byte-offset view — and (b) re-requests
+  the remainder from the new position when a server legitimately
+  satisfies only part of the open-ended range (§15.3.7 / §14.2
+  "re-request the remaining portions later").
+
+### Fixed
+
+- A 206 whose body reaches EOF before the declared Content-Range span
+  is delivered used to silently re-issue the range GET; against a
+  server that repeatedly answers a valid 206 header block with an
+  empty (or immediately-closed) body this degenerated into an
+  unbounded request storm with zero forward progress. Truncation is
+  now surfaced as one `UnexpectedEof` error naming the missing byte
+  count (RFC 9110 §8.6: the declared length is part of the message's
+  self-description).
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-http/compare/v0.0.7...v0.0.8) - 2026-06-15
 
 ### Other

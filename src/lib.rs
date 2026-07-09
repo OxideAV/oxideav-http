@@ -369,6 +369,14 @@ pub struct HttpSource {
     validator: Option<StrongValidator>,
     /// Active response body for the current contiguous read run, if any.
     body: Option<Box<dyn Read + Send>>,
+    /// Bytes the active `body` still promises to deliver. For a 206
+    /// this is derived from the Content-Range span (RFC 9110 §15.3.7:
+    /// "A client MUST inspect a 206 response's Content-Type and
+    /// Content-Range field(s) to determine what parts are enclosed and
+    /// whether additional requests are needed"); for a 200 fallback
+    /// (RFC 7233 §3.1) it is the remainder of the representation after
+    /// the prefix drain. Meaningful only while `body` is `Some`.
+    body_remaining: u64,
 }
 
 impl HttpSource {
@@ -593,6 +601,7 @@ impl HttpSource {
             agent: scoped,
             validator,
             body: None,
+            body_remaining: 0,
         })
     }
 
@@ -611,6 +620,7 @@ impl HttpSource {
     fn issue_range(&mut self) -> io::Result<()> {
         if self.pos >= self.total_len {
             self.body = None;
+            self.body_remaining = 0;
             return Ok(());
         }
         let range = format!("bytes={}-", self.pos);
@@ -743,6 +753,13 @@ impl HttpSource {
         // we did NOT send If-Range; a 200 with If-Range is the
         // mid-stream-mutation case handled above.
         let skip_prefix = if status == 200 { pos } else { 0 };
+        // Bytes the response body promises beyond the prefix drain. For
+        // the 200 fallback that is the whole remainder of the
+        // representation; the 206 branch below narrows it to the
+        // Content-Range span (RFC 9110 §15.3.7: the response is
+        // self-descriptive and may cover less than the requested
+        // open-ended range).
+        let mut span = total_len - pos;
         if status == 200 {
             if let Some(cl) = get_content_length {
                 if cl != total_len {
@@ -856,6 +873,16 @@ impl HttpSource {
                     )));
                 }
             }
+            // RFC 9110 §15.3.7: a 206 "may only partially satisfy" the
+            // range request — the enclosed part is exactly what
+            // Content-Range declares, and "additional requests" cover
+            // the rest. Record the declared span so the read path can
+            // (a) stop at the span boundary instead of trusting the
+            // transport framing, and (b) re-request the remainder from
+            // the new position (§14.2: byte ranges "support efficient
+            // recovery from partially failed transfers and partial
+            // retrieval").
+            span = parsed.last - parsed.first + 1;
         }
         // ureq 3: Body owns the stream; into_body().into_reader() yields
         // a `Read` that pulls from the wire as bytes are requested.
@@ -882,6 +909,7 @@ impl HttpSource {
             }
         }
         self.body = Some(reader);
+        self.body_remaining = span;
         Ok(())
     }
 }
@@ -2355,15 +2383,54 @@ impl Read for HttpSource {
                 self.issue_range()?;
             }
             let body = self.body.as_mut().expect("body just issued");
-            let n = body.read(out)?;
+            // Never read past the span the response declared. With
+            // close-delimited framing (RFC 9112 §6.3 option 8) the
+            // transport would otherwise happily hand us trailing bytes
+            // beyond the Content-Range span, silently skewing `pos`
+            // against the representation's byte offsets. §15.3.7 makes
+            // the 206 self-descriptive: the span is the truth, not the
+            // connection state.
+            let want = out
+                .len()
+                .min(usize::try_from(self.body_remaining).unwrap_or(usize::MAX));
+            if want == 0 {
+                // Span exhausted with the representation not yet
+                // finished: the server satisfied only part of the
+                // open-ended range (permitted by §15.3.7 / §14.2 —
+                // "it may only be possible (or efficient) to send a
+                // portion of the requested ranges first, while
+                // expecting the client to re-request the remaining
+                // portions later"). Issue the follow-up range from the
+                // new position.
+                self.body = None;
+                continue;
+            }
+            let n = body.read(&mut out[..want])?;
             if n > 0 {
                 self.pos += n as u64;
+                self.body_remaining -= n as u64;
                 return Ok(n);
             }
+            // EOF before the declared span was delivered. The old
+            // behaviour silently re-issued the range; against a server
+            // that repeatedly sends a valid 206 header block followed
+            // by an empty/short body that degenerates into an infinite
+            // request storm with zero forward progress. Surface it as
+            // the transport truncation it is (§8.6: the message body
+            // length is part of the message's self-description; a body
+            // shorter than the declared span means the message was
+            // incomplete).
             self.body = None;
-            if self.pos >= self.total_len {
-                return Ok(0);
-            }
+            let missing = self.body_remaining;
+            self.body_remaining = 0;
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "HTTP GET {}: body truncated at pos {} — {missing} byte(s) of the \
+                     declared span still owed (RFC 9110 §15.3.7 Content-Range span / §8.6)",
+                    self.uri, self.pos
+                ),
+            ));
         }
     }
 }
@@ -2380,6 +2447,7 @@ impl Seek for HttpSource {
         }
         if new_pos != self.pos {
             self.body = None;
+            self.body_remaining = 0;
             self.pos = new_pos;
         }
         Ok(new_pos)
@@ -3717,6 +3785,155 @@ mod tests {
     #[allow(dead_code)]
     fn _keep_helper() {
         let _ = make_get_206("bytes 0-9/10", b"0123456789");
+    }
+
+    /// Spawn a minimal HTTP/1.1 server that serves one scripted
+    /// response per accepted connection, in order, then stops
+    /// accepting. Each raw request head is logged on the returned
+    /// channel so tests can assert on request COUNT (no request
+    /// storms, no redundant range GETs) and request CONTENT (Range /
+    /// If-Range field values). Every scripted response should carry
+    /// `Connection: close` so the client opens a fresh connection per
+    /// request and the per-connection script stays aligned.
+    fn spawn_script_server(responses: Vec<Vec<u8>>) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::channel::<String>();
+        thread::spawn(move || {
+            for resp in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                use std::io::Read as _;
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let _ = stream.write_all(&resp);
+                let _ = stream.flush();
+                // Dropping the stream closes the connection — the
+                // close-delimited responses in these tests rely on it
+                // as their end-of-body marker (RFC 9112 §6.3 option 8).
+            }
+        });
+        (format!("http://127.0.0.1:{port}/x"), rx)
+    }
+
+    // -- RFC 9110 §15.3.7 span accounting on the read path -------------------
+
+    #[test]
+    fn local_server_partial_206_reissues_for_remainder() {
+        // §15.3.7: "A server ... might want to send only a subset of
+        // the data requested"; "the client can still understand a
+        // response that only partially satisfies its range request"
+        // and §14.2 expects it to "re-request the remaining portions
+        // later". We ask bytes=0-, the server sends only 0-4/10; the
+        // driver must consume exactly that span and follow up with
+        // bytes=5-.
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_10B_BYTES.to_vec(),
+            make_get_206("bytes 0-4/10", b"01234"),
+            make_get_206("bytes 5-9/10", b"56789"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 3, "expected HEAD + 2 GETs, got {log:#?}");
+        assert!(
+            log[2].to_ascii_lowercase().contains("range: bytes=5-"),
+            "follow-up GET must resume at the span boundary: {:?}",
+            log[2]
+        );
+    }
+
+    #[test]
+    fn local_server_close_framed_206_stops_at_declared_span() {
+        // A close-delimited 206 (no Content-Length — RFC 9112 §6.3
+        // option 8) whose connection carries junk beyond the declared
+        // Content-Range span. §15.3.7 makes the 206 self-descriptive:
+        // the span is the truth, not the transport framing. The junk
+        // must never reach the reader; the driver re-requests the
+        // remainder instead.
+        let mut get1 = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Range: bytes 0-4/10\r\n\
+            Connection: close\r\n\
+            \r\n"
+            .to_vec();
+        get1.extend_from_slice(b"01234JUNKJUNKJUNK");
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_10B_BYTES.to_vec(),
+            get1,
+            make_get_206("bytes 5-9/10", b"56789"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 3, "expected HEAD + 2 GETs, got {log:#?}");
+    }
+
+    #[test]
+    fn local_server_truncated_206_body_is_unexpected_eof() {
+        // Close-delimited 206 declaring bytes 0-9/10 but delivering
+        // only 4 body bytes before the connection closes. §8.6 makes
+        // the declared span part of the message's self-description —
+        // EOF before the span is delivered is a truncated message, not
+        // a clean end-of-body.
+        let mut get = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n"
+            .to_vec();
+        get.extend_from_slice(b"0123");
+        let (uri, _reqs) = spawn_script_server(vec![HEAD_10B_BYTES.to_vec(), get]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        let err = std::io::Read::read_exact(&mut src, &mut buf).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::UnexpectedEof,
+            "wrong kind: {err}"
+        );
+        assert!(err.to_string().contains("truncated"), "wrong error: {err}");
+    }
+
+    #[test]
+    fn local_server_empty_206_body_errors_without_request_storm() {
+        // A server that repeatedly answers a valid 206 header block
+        // followed by an immediately-closed, empty body used to spin
+        // the read loop into an unbounded GET storm (re-issue on EOF,
+        // zero forward progress each time). The span accounting must
+        // surface it as one truncation error after ONE ranged GET.
+        let empty_206 = b"HTTP/1.1 206 Partial Content\r\n\
+            Content-Range: bytes 0-9/10\r\n\
+            Connection: close\r\n\
+            \r\n"
+            .to_vec();
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_10B_BYTES.to_vec(),
+            empty_206.clone(),
+            empty_206.clone(),
+            empty_206,
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        let err = std::io::Read::read_exact(&mut src, &mut buf).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::UnexpectedEof,
+            "wrong kind: {err}"
+        );
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(
+            log.len(),
+            2,
+            "zero-progress truncation must not re-issue the range: {log:#?}"
+        );
     }
 
     // -- RFC 9110 §13.1.5 If-Range strong-validator path ---------------------
