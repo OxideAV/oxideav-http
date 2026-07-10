@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-http/compare/v0.0.8...v0.0.9) - 2026-07-10
+
+### Other
+
+- redirect boundary pins + README fuzz-surface listing
+- RFC 3986 uri surfaces in the parse_headers harness
+- hostile redirect chains + CI clippy byte-str drift fix
+- driver-owned 3xx semantics — RFC 9110 §15.4/§10.2.2 hop walk over RFC 3986 §5 resolution
+- RFC 3986 URI-reference module — §5 reference resolution + §6.2.2/§6.2.3 normalization
+- RFC 9110 §10.2.3 Retry-After hint on non-success probe answers
+- RFC 9112 §7.1/§8 chunked framing composed with driver invariants
+- wire-free EOF/bounds handling + hop-walk drain test + README
+- opt-in GET range-probe fallback for HEAD-hostile servers
+- bounded forward-seek drain over the live body
+- RFC 9110 §14.2 transparent recovery from partially failed transfers
+- read path: RFC 9110 §15.3.7 span accounting + truncation surfacing
+
 ### Added
 
 - Driver-owned redirect semantics (RFC 9110 §15.4 / §10.2.2 + RFC 3986
