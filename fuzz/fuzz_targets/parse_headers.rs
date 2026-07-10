@@ -78,6 +78,17 @@
 //! * `derive_strong_validator` — §13.1.5 + §8.8.2.2 + §8.8.3
 //!   composite that picks an If-Range value from a HEAD's three
 //!   relevant headers.
+//! * `uri_reference` / `uri_reference_lenient` — RFC 3986 Appendix A
+//!   strict charset (resp. structural-only) URI-reference parsing,
+//!   §5.3 recomposition round-trip, §6.2.2/§6.2.3 (+ RFC 9110 §4.2.3)
+//!   normalization fixpoint, and §5.2 resolution against the §5.4
+//!   example base. Contract: never panics; accepted references
+//!   recompose byte-identically; the normal form of a strictly-valid
+//!   reference stays in-grammar and re-normalizes to itself.
+//! * `uri_resolve` — §5.2 reference resolution with a fuzzer-chosen
+//!   base/reference pair (first two NUL-split fields). Contract:
+//!   never panics; the resolved target recomposes and normalizes
+//!   without panicking.
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_http::__fuzz;
@@ -105,12 +116,25 @@ fuzz_target!(|data: &[u8]| {
         let _ = __fuzz::non_identity_content_codings(s);
         let _ = __fuzz::parse_cache_control(s);
         let _ = __fuzz::parse_www_authenticate(s);
+        let _ = __fuzz::uri_reference(s);
+        let _ = __fuzz::uri_reference_lenient(s);
     }
 
     // Pass 2: NUL-split the input into up to three fields for the
     // composite validator. Empty / missing fields are `None`. This is
     // how the fuzzer drives the 8 presence combinations (etag,
     // last-modified, date) × every (UTF-8) field shape.
+    // Pass 2a: the first two NUL-split fields double as a
+    // base/reference pair for RFC 3986 §5.2 resolution.
+    {
+        let mut parts = data.splitn(2, |&b| b == 0);
+        let base = parts.next().and_then(|b| std::str::from_utf8(b).ok());
+        let reference = parts.next().and_then(|b| std::str::from_utf8(b).ok());
+        if let (Some(base), Some(reference)) = (base, reference) {
+            __fuzz::uri_resolve(base, reference);
+        }
+    }
+
     let mut parts = data.splitn(3, |&b| b == 0);
     let etag = parts.next().and_then(|b| std::str::from_utf8(b).ok());
     let lm = parts.next().and_then(|b| std::str::from_utf8(b).ok());

@@ -4231,6 +4231,62 @@ pub mod __fuzz {
     pub fn parse_www_authenticate(s: &str) -> usize {
         super::parse_www_authenticate(s).len()
     }
+
+    /// Fuzz-only wrapper for the RFC 3986 [`crate::uri`] module's
+    /// strict path: Appendix A charset validation, §5.3 recomposition,
+    /// §6.2.2/§6.2.3 (+ RFC 9110 §4.2.3) normalization, and §5.2
+    /// resolution against the §5.4 example base. Contract: never
+    /// panics; a strictly-parsed reference recomposes byte-identically;
+    /// the normal form of a strictly-valid reference is itself strictly
+    /// valid and a normalization fixpoint.
+    pub fn uri_reference(s: &str) -> bool {
+        let Ok(u) = crate::uri::UriRef::parse(s) else {
+            return false;
+        };
+        assert_eq!(u.to_string(), s, "§5.3 recomposition round-trip");
+        let n = u.normalized();
+        let reparsed = crate::uri::UriRef::parse(&n).expect("normal form must stay in-grammar");
+        assert_eq!(reparsed.normalized(), n, "normalization fixpoint");
+        let base = crate::uri::UriRef::parse("http://a/b/c/d;p?q").expect("static base");
+        if let Ok(t) = base.resolve(&u) {
+            let _ = t.to_string();
+            let _ = t.normalized();
+            let _ = t.without_fragment();
+        }
+        true
+    }
+
+    /// Fuzz-only wrapper for [`crate::uri`]'s lenient path (the
+    /// caller-URI posture: structural checks only). Contract: never
+    /// panics; an accepted reference recomposes byte-identically and
+    /// its authority splits without panicking.
+    pub fn uri_reference_lenient(s: &str) -> bool {
+        let Ok(u) = crate::uri::UriRef::parse_lenient(s) else {
+            return false;
+        };
+        assert_eq!(u.to_string(), s, "§5.3 recomposition round-trip");
+        let _ = u.authority_parts();
+        let _ = u.normalized();
+        let _ = u.without_fragment();
+        true
+    }
+
+    /// Fuzz-only wrapper for RFC 3986 §5.2 reference resolution with a
+    /// fuzzer-chosen base: both sides strict-parsed, resolution (when
+    /// the base is absolute) must not panic and its output must
+    /// recompose and normalize without panicking.
+    pub fn uri_resolve(base: &str, reference: &str) {
+        let (Ok(b), Ok(r)) = (
+            crate::uri::UriRef::parse(base),
+            crate::uri::UriRef::parse(reference),
+        ) else {
+            return;
+        };
+        if let Ok(t) = b.resolve(&r) {
+            let _ = t.to_string();
+            let _ = t.normalized();
+        }
+    }
 }
 
 #[cfg(test)]

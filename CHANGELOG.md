@@ -50,6 +50,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   driver-owned redirect semantics (`Location` is a URI-reference
   resolved against the target URI — RFC 9110 §10.2.2).
 
+- Fuzz surface for the `uri` module: `__fuzz::uri_reference` /
+  `uri_reference_lenient` / `uri_resolve` wire RFC 3986 strict and
+  lenient parsing, §5.3 recomposition round-trip, normalization
+  fixpoint, and §5.2 resolution (base/reference from the harness's
+  NUL-split fields) into the existing `parse_headers` fuzz target,
+  with seed corpus entries for the §5.4 base, dot-segment references,
+  network-path references, the RFC 9110 §4.2.3 normalization example,
+  an IPv6 literal, and a userinfo-bearing reference.
+
 - Chunked-framing composition coverage (RFC 9112 §7.1 + §8): scripted
   loopback tests pin that span accounting, the 200-fallback prefix
   drain, §14.2 resume, and the request-storm bounds all compose
