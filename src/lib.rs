@@ -9244,4 +9244,102 @@ mod tests {
         assert!(log[1].starts_with("GET /x "), "{:?}", log[1]);
         assert!(log[2].starts_with("GET /m "), "{:?}", log[2]);
     }
+
+    #[test]
+    fn redirect_cap_zero_with_following_enabled_is_distinct_from_off() {
+        // max_redirects(0) + following enabled: the walk WANTS to
+        // follow but the cap forbids the first hop — the error names
+        // the cap, unlike follow_redirects(false) which surfaces the
+        // 3xx status.
+        let (uri, reqs) = spawn_script_server(vec![redirect_bytes(301, "/a")]);
+        let cfg = HttpConfig::builder().max_redirects(0).build();
+        let err = HttpSource::open_with_config(&uri, &cfg)
+            .err()
+            .expect("must fail");
+        assert!(err.to_string().contains("max_redirects=0"), "{err}");
+        assert_eq!(reqs.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn redirect_chain_ending_in_300_surfaces_that_status() {
+        // A followable hop into a non-followable 3xx: the 300 is the
+        // walk's final answer (§15.4.1 MAY declined), reported as its
+        // own status — not misattributed to the redirect machinery.
+        let (uri, reqs) = spawn_script_server(vec![
+            redirect_bytes(301, "/choices"),
+            redirect_bytes(300, "/preferred"),
+        ]);
+        let err = HttpSource::open(&uri).err().expect("must fail");
+        assert!(err.to_string().contains("status 300"), "{err}");
+        assert_eq!(
+            reqs.try_iter().count(),
+            2,
+            "the 300's Location is not followed"
+        );
+    }
+
+    #[test]
+    fn redirect_surfaced_3xx_carries_the_retry_after_hint() {
+        // §10.2.3: "When sent with any 3xx (Redirection) response,
+        // Retry-After indicates the minimum time that the user agent
+        // is asked to wait before issuing the redirected request."
+        // The driver never sleeps, but when a 3xx surfaces (following
+        // disabled) the parsed hint must ride the error so a caller
+        // wiring back-off has it without re-fetching.
+        let (uri, _reqs) = spawn_script_server(vec![b"HTTP/1.1 302 Found\r\n\
+              Location: /busy\r\n\
+              Retry-After: 120\r\n\
+              Content-Length: 0\r\n\
+              Connection: close\r\n\
+              \r\n"
+            .to_vec()]);
+        let cfg = HttpConfig::builder().follow_redirects(false).build();
+        let err = HttpSource::open_with_config(&uri, &cfg)
+            .err()
+            .expect("must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("status 302"), "{msg}");
+        assert!(msg.contains("120"), "Retry-After hint missing: {msg}");
+    }
+
+    #[test]
+    fn redirect_network_path_reference_takes_scheme_from_base() {
+        // §5.4.1: "//g" → "http://g" — a network-path Location keeps
+        // the base scheme and replaces the whole authority. The
+        // canned-response helper cannot parametrise a Location on its
+        // own port, so this test runs a dedicated listener whose 301
+        // points a network-path reference back at itself.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let responses = vec![
+            redirect_bytes(301, &format!("//127.0.0.1:{port}/np")),
+            HEAD_10B_BYTES.to_vec(),
+            make_get_206("bytes 0-9/10", b"0123456789"),
+        ];
+        let (tx, rx) = mpsc::channel::<String>();
+        thread::spawn(move || {
+            for resp in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                use std::io::Read as _;
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let _ = stream.write_all(&resp);
+                let _ = stream.flush();
+            }
+        });
+        let mut src = HttpSource::open(&format!("http://127.0.0.1:{port}/x")).expect("open");
+        assert!(src.request_uri().ends_with("/np"), "{}", src.request_uri());
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+        let log: Vec<String> = rx.try_iter().collect();
+        assert_eq!(log.len(), 3, "{log:#?}");
+        assert!(log[1].starts_with("HEAD /np "), "{:?}", log[1]);
+    }
 }

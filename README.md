@@ -744,8 +744,13 @@ list filter behind the content-coding refusal),
 `parse_www_authenticate` (RFC 9110 §11.6.1 `WWW-Authenticate =
 #challenge` with the §11.6.1 challenge/auth-param list disambiguation
 and §11.2 `token68` vs `auth-param` discrimination),
-and the composite
-`derive_strong_validator` (§13.1.5 + §8.8.2.2 + §8.8.3).
+the composite
+`derive_strong_validator` (§13.1.5 + §8.8.2.2 + §8.8.3),
+and the RFC 3986 `uri` module (`uri_reference` /
+`uri_reference_lenient` / `uri_resolve`: strict + lenient
+URI-reference parsing with §5.3 recomposition round-trip,
+§6.2.2/§6.2.3 normalization-fixpoint contract, and §5.2 reference
+resolution over fuzzer-chosen base/reference pairs).
 The harness
 reaches the parsers through a `#[doc(hidden)] pub mod __fuzz`
 re-export gated on the `fuzz` cargo feature, so the stable public
