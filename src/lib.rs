@@ -5404,7 +5404,7 @@ mod tests {
         ]);
         let mut src = HttpSource::open(&uri).expect("open");
         let mut one = [0u8; 1];
-        for expected in [b'0', b'3', b'6'] {
+        for expected in *b"036" {
             std::io::Read::read_exact(&mut src, &mut one).expect("read");
             assert_eq!(one[0], expected);
             std::io::Seek::seek(&mut src, SeekFrom::Current(2)).expect("seek");
@@ -7526,9 +7526,9 @@ mod tests {
         // (0x0D) and LF (0x0A) are control bytes outside that RHS,
         // and a quoted-pair'd bare line-ending would unbalance the
         // field line at the framing layer.
-        let cr = [b'"', b'a', b'\\', b'\r', b'b', b'"'];
+        let cr = *b"\"a\\\rb\"";
         assert!(unquote_string(std::str::from_utf8(&cr).unwrap()).is_none());
-        let lf = [b'"', b'a', b'\\', b'\n', b'b', b'"'];
+        let lf = *b"\"a\\\nb\"";
         assert!(unquote_string(std::str::from_utf8(&lf).unwrap()).is_none());
     }
 
@@ -8934,5 +8934,258 @@ mod tests {
             3,
             "the 303 target must never be contacted"
         );
+    }
+
+    // -- Hostile redirect chains ----------------------------------------------
+
+    #[test]
+    fn redirect_self_loop_is_detected_on_the_first_hop() {
+        // §15.4: "A client SHOULD detect and intervene in cyclical
+        // redirections". Location → the request's own URI: caught by
+        // the normalized-URI visited set before any second request.
+        let (uri, reqs) = spawn_script_server(vec![redirect_bytes(301, "/x")]);
+        let err = HttpSource::open(&uri).err().expect("must fail");
+        assert!(err.to_string().contains("cyclical"), "{err}");
+        assert_eq!(reqs.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn redirect_two_node_loop_is_detected() {
+        let (uri, reqs) =
+            spawn_script_server(vec![redirect_bytes(301, "/b"), redirect_bytes(302, "/x")]);
+        let err = HttpSource::open(&uri).err().expect("must fail");
+        assert!(err.to_string().contains("cyclical"), "{err}");
+        assert_eq!(reqs.try_iter().count(), 2, "loop caught before request 3");
+    }
+
+    #[test]
+    fn redirect_loop_detection_sees_through_normalization() {
+        // The loop key is the RFC 9110 §4.2.3 normal form, so a
+        // Location that spells the same resource with dot segments
+        // and percent-encoded unreserved bytes cannot evade
+        // detection: "/a/../%78" ≡ "/x" (§6.2.2.2 + §6.2.2.3).
+        let (uri, reqs) = spawn_script_server(vec![redirect_bytes(301, "/a/../%78")]);
+        let err = HttpSource::open(&uri).err().expect("must fail");
+        assert!(err.to_string().contains("cyclical"), "{err}");
+        assert_eq!(reqs.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn redirect_empty_location_value_is_a_self_loop() {
+        // `Location:` with an empty value is a valid URI-reference
+        // that resolves to the request URI itself (RFC 3986 §5.2.2's
+        // empty-path branch) — cyclical, not followable.
+        let (uri, reqs) = spawn_script_server(vec![b"HTTP/1.1 301 Moved\r\n\
+              Location: \r\n\
+              Content-Length: 0\r\n\
+              Connection: close\r\n\
+              \r\n"
+            .to_vec()]);
+        let err = HttpSource::open(&uri).err().expect("must fail");
+        assert!(err.to_string().contains("cyclical"), "{err}");
+        assert_eq!(reqs.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn redirect_oversized_chain_stops_at_the_default_cap() {
+        // Twelve distinct hops against the default cap of 10: the
+        // walk must stop after the initial request + 10 hops (11
+        // requests) with a bounded, precise error.
+        let responses: Vec<Vec<u8>> = (0..12)
+            .map(|i| redirect_bytes(301, &format!("/hop{i}")))
+            .collect();
+        let (uri, reqs) = spawn_script_server(responses);
+        let err = HttpSource::open(&uri).err().expect("must fail");
+        assert!(err.to_string().contains("max_redirects=10"), "{err}");
+        assert_eq!(reqs.try_iter().count(), 11, "initial request + 10 hops");
+    }
+
+    #[test]
+    fn redirect_userinfo_location_is_refused_without_contact() {
+        // RFC 9110 §4.2.4: userinfo in a reference from an untrusted
+        // source is "likely being used to obscure the authority for
+        // the sake of phishing attacks" — refuse before any
+        // connection to the smuggled authority.
+        let (uri, reqs) = spawn_script_server(vec![redirect_bytes(
+            301,
+            "http://127.0.0.1:1@127.0.0.1:2/y",
+        )]);
+        let err = HttpSource::open(&uri).err().expect("must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("userinfo") && msg.contains("4.2.4"), "{msg}");
+        assert_eq!(reqs.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn redirect_malformed_location_values_are_refused() {
+        // §10.2.2 permits recovery from invalid Location references
+        // but does not mandate it; the driver refuses, each with the
+        // grammar-level reason.
+        for (loc, want) in [
+            ("http://exa mple/", "invalid Location"), // raw space
+            ("/y%zz", "invalid Location"),            // broken pct-encoding
+            ("http://h:80x/y", "invalid Location"),   // non-digit port
+            ("ftp://h/y", "http/https only"),         // wrong scheme
+            ("http:///y", "empty host"),              // §4.2.1 MUST reject
+            ("http://[::1/y", "invalid Location"),    // unterminated IP-literal
+        ] {
+            let (uri, reqs) = spawn_script_server(vec![redirect_bytes(301, loc)]);
+            let err = HttpSource::open(&uri).err().expect("must fail");
+            assert!(
+                err.to_string().contains(want),
+                "Location {loc:?}: wanted {want:?} in: {err}"
+            );
+            assert_eq!(reqs.try_iter().count(), 1, "Location {loc:?}");
+        }
+    }
+
+    #[test]
+    fn redirect_without_location_surfaces_the_status() {
+        // §15.4: "If a Location header field is provided, the user
+        // agent MAY automatically redirect" — without one there is
+        // nothing to follow; the 3xx is the final answer.
+        let (uri, reqs) = spawn_script_server(vec![b"HTTP/1.1 301 Moved\r\n\
+              Content-Length: 0\r\n\
+              Connection: close\r\n\
+              \r\n"
+            .to_vec()]);
+        let err = HttpSource::open(&uri).err().expect("must fail");
+        assert!(err.to_string().contains("status 301"), "{err}");
+        assert_eq!(reqs.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn redirect_multiple_location_lines_are_refused() {
+        // §10.2.2 note: a Location value cannot be a list; multiple
+        // field lines come from an invalid message and recovery "is
+        // difficult and not interoperable" — refuse rather than pick.
+        let (uri, reqs) = spawn_script_server(vec![b"HTTP/1.1 301 Moved\r\n\
+              Location: /a\r\n\
+              Location: /b\r\n\
+              Content-Length: 0\r\n\
+              Connection: close\r\n\
+              \r\n"
+            .to_vec()]);
+        let err = HttpSource::open(&uri).err().expect("must fail");
+        assert!(err.to_string().contains("multiple"), "{err}");
+        assert_eq!(
+            reqs.try_iter().count(),
+            1,
+            "neither target may be contacted"
+        );
+    }
+
+    #[test]
+    fn redirect_cross_host_hop_denied_without_contact() {
+        // The policy check runs before any connection: the target
+        // host here is unreachable (port 1), so a policy-shaped error
+        // proves the wire was never touched.
+        let cfg = HttpConfig::builder().redirect_same_host_only(true).build();
+        let (uri, reqs) = spawn_script_server(vec![redirect_bytes(301, "http://localhost:1/y")]);
+        let err = HttpSource::open_with_config(&uri, &cfg)
+            .err()
+            .expect("must fail");
+        assert!(err.to_string().contains("redirect_same_host_only"), "{err}");
+        assert_eq!(reqs.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn https_only_refuses_the_initial_plain_http_request() {
+        let cfg = HttpConfig::builder().https_only(true).build();
+        let (uri, reqs) = spawn_script_server(vec![]);
+        let err = HttpSource::open_with_config(&uri, &cfg)
+            .err()
+            .expect("must fail");
+        assert!(err.to_string().contains("https_only"), "{err}");
+        assert_eq!(reqs.try_iter().count(), 0, "no request may be issued");
+    }
+
+    #[test]
+    fn redirect_hop_transport_error_names_the_hop() {
+        // A hop target that refuses the connection must be reported
+        // as that hop, not as a failure of the original URI.
+        let (uri, reqs) = spawn_script_server(vec![redirect_bytes(301, "http://127.0.0.1:1/y")]);
+        let err = HttpSource::open(&uri).err().expect("must fail");
+        assert!(err.to_string().contains("redirect hop 1"), "{err}");
+        assert_eq!(reqs.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn redirect_location_query_survives_to_the_wire() {
+        // query = *( pchar / "/" / "?" ) is part of the resolved
+        // target (RFC 3986 §5.2.2 sets T.query = R.query); it must
+        // ride into the hop's request target.
+        let (uri, reqs) = spawn_script_server(vec![
+            redirect_bytes(301, "/y?tok=abc&v=1"),
+            HEAD_10B_BYTES.to_vec(),
+            make_get_206("bytes 0-9/10", b"0123456789"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 3, "{log:#?}");
+        assert!(log[1].starts_with("HEAD /y?tok=abc&v=1 "), "{:?}", log[1]);
+        assert!(log[2].starts_with("GET /y?tok=abc&v=1 "), "{:?}", log[2]);
+    }
+
+    #[test]
+    fn redirect_seek_reissues_against_the_rewritten_uri() {
+        // After a permanent hop, a backward seek's fresh range GET
+        // must target the rewritten URI directly, with the new
+        // offset.
+        let (uri, reqs) = spawn_script_server(vec![
+            redirect_bytes(308, "/moved"),
+            HEAD_10B_BYTES.to_vec(),
+            make_get_206("bytes 0-9/10", b"0123456789"),
+            make_get_206("bytes 1-9/10", b"123456789"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf4 = [0u8; 4];
+        std::io::Read::read_exact(&mut src, &mut buf4).expect("first read");
+        assert_eq!(&buf4, b"0123");
+        std::io::Seek::seek(&mut src, SeekFrom::Start(1)).expect("seek");
+        let mut buf9 = [0u8; 9];
+        std::io::Read::read_exact(&mut src, &mut buf9).expect("second read");
+        assert_eq!(&buf9, b"123456789");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 4, "{log:#?}");
+        assert!(log[3].starts_with("GET /moved "), "{:?}", log[3]);
+        assert!(
+            log[3].to_ascii_lowercase().contains("range: bytes=1-"),
+            "{:?}",
+            log[3]
+        );
+    }
+
+    #[test]
+    fn redirect_probe_open_walks_hops_like_the_head_it_replaces() {
+        // HEAD-hostile origin: HEAD answers 405, the opt-in probe GET
+        // is redirected, and the probe's 206 at the target supplies
+        // total length, validator surface, and the initial body.
+        static HEAD_405: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\n\
+            Content-Length: 0\r\n\
+            Connection: close\r\n\
+            \r\n";
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_405.to_vec(),
+            redirect_bytes(301, "/m"),
+            make_get_206("bytes 0-9/10", b"0123456789"),
+        ]);
+        let cfg = probe_cfg();
+        let mut src = HttpSource::open_with_config(&uri, &cfg).expect("open");
+        assert_eq!(src.len(), 10);
+        assert!(src.request_uri().ends_with("/m"), "{}", src.request_uri());
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(
+            log.len(),
+            3,
+            "probe body is reused — no extra GET: {log:#?}"
+        );
+        assert!(log[1].starts_with("GET /x "), "{:?}", log[1]);
+        assert!(log[2].starts_with("GET /m "), "{:?}", log[2]);
     }
 }
