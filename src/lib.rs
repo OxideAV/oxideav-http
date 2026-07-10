@@ -87,6 +87,8 @@
 //! makes `bytes=0-` unsatisfiable against a zero-length
 //! representation, so that 416 is range support working correctly).
 
+pub mod uri;
+
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::OnceLock;
 use std::time::Duration;

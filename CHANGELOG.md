@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `oxideav_http::uri` — an RFC 3986 URI-reference module: strict and
+  lenient parsing against the Appendix A collected ABNF (five-component
+  split per §3 with the Appendix B first-match-wins disambiguation),
+  §5.2 reference resolution (strict §5.2.2 transform, §5.2.3 `merge`,
+  §5.2.4 `remove_dot_segments`), §5.3 recomposition preserving the
+  undefined-vs-empty component distinction, and `normalized()`
+  comparison keys implementing §6.2.2 syntax-based normalization plus
+  the RFC 9110 §4.2.3 `http`/`https` scheme-based rules (default-port
+  elision, empty path → `/`). All 41 resolution examples from §5.4.1
+  and §5.4.2 are pinned as tests. This is the substrate for the
+  driver-owned redirect semantics (`Location` is a URI-reference
+  resolved against the target URI — RFC 9110 §10.2.2).
+
 - Chunked-framing composition coverage (RFC 9112 §7.1 + §8): scripted
   loopback tests pin that span accounting, the 200-fallback prefix
   drain, §14.2 resume, and the request-storm bounds all compose
