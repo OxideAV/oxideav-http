@@ -19,10 +19,10 @@
 //!
 //! ## Configuring the underlying agent
 //!
-//! By default the driver uses a process-wide `ureq` agent with library
-//! defaults. To tighten policy (redirect cap, downgrade-safe
-//! `Authorization` handling, custom `User-Agent`, timeouts, https-only
-//! mode) build an [`HttpConfig`] and either:
+//! By default the driver uses a process-wide agent. To tighten policy
+//! (redirect following/cap/scheme/host restrictions, custom
+//! `User-Agent`, timeouts, https-only mode) build an [`HttpConfig`]
+//! and either:
 //!
 //! 1. Install it once at startup with [`install_default_config`], so
 //!    every `ctx.sources.open("http://…")` call honours it; or
@@ -37,6 +37,26 @@
 //!     .build();
 //! oxideav_http::install_default_config(cfg).ok();
 //! ```
+//!
+//! ## Driver-owned redirects (RFC 9110 §15.4 / §10.2.2, RFC 3986 §5)
+//!
+//! The driver follows 3xx redirects itself — the transport layer
+//! hands every 3xx back unfollowed. `Location` is parsed as a
+//! URI-reference and resolved against the current target URI with the
+//! RFC 3986 §5 machinery in [`uri`]. Permanent hops (301/308) rewrite
+//! the URI future range GETs target; temporary hops (302/307) are
+//! re-walked per request; a 303 at open rebases the anchor to its
+//! target (§15.4.4: the original resource has no transferable
+//! representation), while a 303 during a range-anchored GET is fatal.
+//! Policy knobs: [`HttpConfigBuilder::follow_redirects`],
+//! [`HttpConfigBuilder::max_redirects`] (+ `max_redirects_will_error`),
+//! [`HttpConfigBuilder::redirect_scheme_policy`], and
+//! [`HttpConfigBuilder::redirect_same_host_only`]. Cyclical
+//! redirections are detected over §4.2.3-normalized URIs, and hostile
+//! `Location` values (userinfo per §4.2.4, empty host, out-of-grammar
+//! bytes, non-http(s) schemes, multiple field lines) are refused with
+//! precise cites. `Range` / `If-Range` ride along on every hop, so
+//! the §13.1.5 validator guards whichever origin finally answers.
 //!
 //! ## Mid-stream mutation detection (RFC 9110 §13.1.5)
 //!
@@ -133,9 +153,14 @@ pub fn open_http(uri: &str) -> Result<Box<dyn BytesSource>> {
 /// Policy for re-sending an `Authorization` header across an HTTP
 /// redirect.
 ///
-/// Mirrors `ureq::config::RedirectAuthHeaders` — exposed here so the
-/// public surface stays independent of which underlying client we wire
-/// in. Default is [`RedirectAuthPolicy::Never`].
+/// Retained on the config surface for compatibility. The driver never
+/// generates an `Authorization` header itself, and its redirect walk
+/// re-sends only the headers it generated for the original request
+/// (`Range`, `If-Range`, `Accept-Encoding`) — credentials are never
+/// carried onto a redirect target, matching the strictest reading of
+/// RFC 9110 §15.4's header-modification guidance, which lists
+/// `Authorization` among the resource-specific fields to remove. Both
+/// variants therefore currently behave as [`RedirectAuthPolicy::Never`].
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub enum RedirectAuthPolicy {
     /// Strip `Authorization` on every redirect.
@@ -145,6 +170,24 @@ pub enum RedirectAuthPolicy {
     /// and the scheme does not downgrade (e.g. `https` → `https` is
     /// fine, `https` → `http` is not).
     SameHost,
+}
+
+/// Constraint on how a redirect target's scheme may differ from the
+/// scheme of the request that received the 3xx (per hop).
+///
+/// Independent of [`HttpConfigBuilder::https_only`], which refuses
+/// every non-`https` request outright, including the first one.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub enum RedirectSchemePolicy {
+    /// `http` ↔ `https` hops are allowed in both directions (default —
+    /// matches the historical transparent-following behaviour).
+    #[default]
+    Any,
+    /// The scheme may stay the same or upgrade `http` → `https`; a
+    /// `https` → `http` downgrade hop is refused.
+    UpgradeOnly,
+    /// The scheme must not change across any hop.
+    Same,
 }
 
 /// Tunable policy for the HTTP/HTTPS source driver.
@@ -160,9 +203,12 @@ pub enum RedirectAuthPolicy {
 /// or pass to [`HttpSource::open_with_config`] per-request.
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
+    follow_redirects: bool,
     max_redirects: u32,
     max_redirects_will_error: bool,
     redirect_auth_policy: RedirectAuthPolicy,
+    redirect_scheme_policy: RedirectSchemePolicy,
+    redirect_same_host_only: bool,
     user_agent: Option<String>,
     https_only: bool,
     timeout_global: Option<Duration>,
@@ -174,14 +220,16 @@ pub struct HttpConfig {
 
 impl Default for HttpConfig {
     fn default() -> Self {
-        // ureq 3 defaults: 10 redirects, error on cap, no user-agent
-        // override, no https-only, no timeouts. We override
-        // `redirect_auth_policy` to `Never` (matches ureq's own
-        // default but pin it explicitly for surface clarity).
+        // Redirect defaults preserve the historical observable
+        // behaviour: automatic following, a 10-hop cap that errors
+        // when exceeded, no cross-scheme / cross-host restriction.
         Self {
+            follow_redirects: true,
             max_redirects: 10,
             max_redirects_will_error: true,
             redirect_auth_policy: RedirectAuthPolicy::Never,
+            redirect_scheme_policy: RedirectSchemePolicy::Any,
+            redirect_same_host_only: false,
             user_agent: None,
             https_only: false,
             timeout_global: None,
@@ -201,21 +249,51 @@ impl HttpConfig {
         }
     }
 
-    /// Maximum number of redirects the client will follow before
-    /// giving up.
+    /// Whether the driver follows 3xx redirects at all (RFC 9110
+    /// §15.4: a user agent "MAY automatically redirect"). When
+    /// `false`, the first 3xx answer is treated as the final response
+    /// — `open` then fails with its status. Default `true`.
+    pub fn follow_redirects(&self) -> bool {
+        self.follow_redirects
+    }
+
+    /// Maximum number of redirect hops the driver will follow on one
+    /// request before giving up. Loop detection (RFC 9110 §15.4: "A
+    /// client SHOULD detect and intervene in cyclical redirections")
+    /// is separate and fires regardless of this cap.
     pub fn max_redirects(&self) -> u32 {
         self.max_redirects
     }
 
     /// Whether exceeding [`Self::max_redirects`] surfaces as an error
-    /// (`true`) or returns the final 3xx response (`false`).
+    /// (`true`) or hands back the final 3xx response (`false`) — the
+    /// caller then sees that response's status as the outcome.
     pub fn max_redirects_will_error(&self) -> bool {
         self.max_redirects_will_error
     }
 
-    /// Redirect handling for the `Authorization` header.
+    /// Redirect handling for the `Authorization` header. See
+    /// [`RedirectAuthPolicy`] — the driver generates no
+    /// `Authorization` header and never carries one across a hop, so
+    /// both variants currently behave as
+    /// [`RedirectAuthPolicy::Never`].
     pub fn redirect_auth_policy(&self) -> RedirectAuthPolicy {
         self.redirect_auth_policy
+    }
+
+    /// Per-hop constraint on redirect scheme changes. Default
+    /// [`RedirectSchemePolicy::Any`].
+    pub fn redirect_scheme_policy(&self) -> RedirectSchemePolicy {
+        self.redirect_scheme_policy
+    }
+
+    /// When `true`, a redirect target whose host differs from the
+    /// redirecting request's host (case-insensitive, per RFC 3986
+    /// §6.2.2.1) is refused. Ports may still differ — scheme changes
+    /// are governed by [`Self::redirect_scheme_policy`]. Default
+    /// `false`.
+    pub fn redirect_same_host_only(&self) -> bool {
+        self.redirect_same_host_only
     }
 
     /// Custom `User-Agent` header value, if set.
@@ -284,7 +362,15 @@ pub struct HttpConfigBuilder {
 }
 
 impl HttpConfigBuilder {
-    /// Cap the redirect chain. ureq's default is 10.
+    /// Enable or disable automatic redirect following (RFC 9110 §15.4
+    /// MAY). Default `true`; with `false` the first 3xx is the final
+    /// answer and `open` fails with its status.
+    pub fn follow_redirects(mut self, v: bool) -> Self {
+        self.inner.follow_redirects = v;
+        self
+    }
+
+    /// Cap the redirect chain. Default 10.
     pub fn max_redirects(mut self, n: u32) -> Self {
         self.inner.max_redirects = n;
         self
@@ -298,9 +384,24 @@ impl HttpConfigBuilder {
     }
 
     /// How `Authorization` should be carried across redirects. Default
-    /// is [`RedirectAuthPolicy::Never`].
+    /// is [`RedirectAuthPolicy::Never`] — see [`RedirectAuthPolicy`]
+    /// for why both variants currently behave identically.
     pub fn redirect_auth_policy(mut self, p: RedirectAuthPolicy) -> Self {
         self.inner.redirect_auth_policy = p;
+        self
+    }
+
+    /// Constrain per-hop scheme changes across redirects. Default
+    /// [`RedirectSchemePolicy::Any`].
+    pub fn redirect_scheme_policy(mut self, p: RedirectSchemePolicy) -> Self {
+        self.inner.redirect_scheme_policy = p;
+        self
+    }
+
+    /// When `true`, refuse redirect hops that change the host.
+    /// Default `false`.
+    pub fn redirect_same_host_only(mut self, v: bool) -> Self {
+        self.inner.redirect_same_host_only = v;
         self
     }
 
@@ -363,13 +464,16 @@ impl HttpConfigBuilder {
 
 fn agent_from(cfg: &HttpConfig) -> Agent {
     let mut b = Agent::config_builder()
-        .max_redirects(cfg.max_redirects)
-        .max_redirects_will_error(cfg.max_redirects_will_error)
+        // The driver owns redirect semantics (RFC 9110 §15.4 /
+        // §10.2.2 / RFC 3986 §5): the transport layer must hand every
+        // 3xx back unfollowed and unerrored so the hop walk above it
+        // can resolve the Location reference, classify the status,
+        // and apply the configured policy. `cfg.max_redirects` /
+        // `cfg.follow_redirects` etc. are enforced by that walk, not
+        // here.
+        .max_redirects(0)
+        .max_redirects_will_error(false)
         .https_only(cfg.https_only)
-        .redirect_auth_headers(match cfg.redirect_auth_policy {
-            RedirectAuthPolicy::Never => ureq::config::RedirectAuthHeaders::Never,
-            RedirectAuthPolicy::SameHost => ureq::config::RedirectAuthHeaders::SameHost,
-        })
         // Inspect 4xx/5xx ourselves so we can give RFC 9110 §15.5.17 +
         // §14.4 treatment to 416 (Range Not Satisfiable). With the
         // status-as-error default, the response's Content-Range body is
@@ -429,6 +533,353 @@ fn agent() -> &'static Agent {
 }
 
 // ---------------------------------------------------------------------------
+// Driver-owned redirect walk (RFC 9110 §15.4 / §10.2.2, RFC 3986 §5)
+// ---------------------------------------------------------------------------
+
+type WireResponse = ureq::http::Response<ureq::Body>;
+
+/// The two request methods this driver ever issues. Both are safe
+/// retrieval methods (RFC 9110 §9.2.1 / §9.3.1–§9.3.2), which makes
+/// the §15.4 method-rewrite rules vacuous for us: 307/308 MUST NOT
+/// change the method, 301/302's historical POST→GET latitude does not
+/// apply to GET/HEAD, and 303's "retrieval request targeting that URI
+/// (a GET or HEAD request if using HTTP)" (§15.4.4) is exactly what we
+/// were already sending — so every hop re-sends the original method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestMethod {
+    Head,
+    Get,
+}
+
+fn send_once(
+    agent: &Agent,
+    method: RequestMethod,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> std::result::Result<WireResponse, ureq::Error> {
+    let mut req = match method {
+        RequestMethod::Head => agent.head(uri),
+        RequestMethod::Get => agent.get(uri),
+    };
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
+    req.call()
+}
+
+/// RFC 9110 §15.4's split of the followable 3xx classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HopKind {
+    /// 301 / 308: "the target resource has been assigned a new
+    /// permanent URI and any future references to this resource ought
+    /// to use one of the enclosed URIs" (§15.4.2 / §15.4.9).
+    Permanent,
+    /// 302 / 307: "the client ought to continue to use the target URI
+    /// for future requests" (§15.4.3 / §15.4.8) — and 303, whose
+    /// Location target "is not considered equivalent to the target
+    /// URI" (§15.4.4), so it must never rewrite what we ask for next
+    /// time either.
+    Temporary,
+}
+
+/// Classify a status as an automatically followable redirect. 300
+/// (Multiple Choices) is reactive negotiation — following its optional
+/// Location is a MAY (§15.4.1) this driver declines, since picking a
+/// representation variant blind defeats the byte-exactness the source
+/// contract needs. 304 is a cache signal (§15.4.5) that a request
+/// without conditional headers must never receive. 305/306 are
+/// deprecated/reserved (§15.4.6 / §15.4.7).
+fn redirect_class(status: u16) -> Option<HopKind> {
+    match status {
+        301 | 308 => Some(HopKind::Permanent),
+        302 | 303 | 307 => Some(HopKind::Temporary),
+        _ => None,
+    }
+}
+
+/// Checks applied to the caller's own request URI before the first
+/// request. Userinfo is tolerated here (the URI comes from the
+/// caller, not from the network; RFC 9110 §4.2.4's SHOULD-error is
+/// scoped to references "received from an untrusted source").
+fn initial_uri_check(knobs: &HttpConfig, u: &uri::UriRef) -> std::result::Result<(), String> {
+    let scheme = u.scheme().unwrap_or("");
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(format!(
+            "unsupported URI scheme {scheme:?} — this driver speaks http/https only"
+        ));
+    }
+    let (_, host, _) = u.authority_parts().map_err(|e| e.to_string())?;
+    if host.unwrap_or("").is_empty() {
+        return Err(
+            "http(s) URI with an empty host identifier — a recipient MUST reject it as \
+             invalid (RFC 9110 §4.2.1 / §4.2.2)"
+                .to_owned(),
+        );
+    }
+    if knobs.https_only() && scheme.eq_ignore_ascii_case("http") {
+        return Err("plain-http request refused by https_only policy".to_owned());
+    }
+    Ok(())
+}
+
+/// Policy gate for one redirect hop `from` → `to`. Returns the refusal
+/// reason, if any. `to` must already be fully resolved (absolute).
+fn hop_policy_check(
+    knobs: &HttpConfig,
+    from: &uri::UriRef,
+    to: &uri::UriRef,
+) -> std::result::Result<(), String> {
+    let to_scheme = to.scheme().unwrap_or("").to_ascii_lowercase();
+    if to_scheme != "http" && to_scheme != "https" {
+        return Err(format!(
+            "redirect target {to} has scheme {to_scheme:?} — this driver speaks http/https only"
+        ));
+    }
+    let (userinfo, host, _) = to.authority_parts().map_err(|e| e.to_string())?;
+    if host.unwrap_or("").is_empty() {
+        return Err(format!(
+            "redirect target {to} has an empty host identifier — a recipient MUST reject it \
+             as invalid (RFC 9110 §4.2.1 / §4.2.2)"
+        ));
+    }
+    if userinfo.is_some() {
+        // §4.2.4: "Before making use of an 'http' or 'https' URI
+        // reference received from an untrusted source, a recipient
+        // SHOULD parse for userinfo and treat its presence as an
+        // error; it is likely being used to obscure the authority for
+        // the sake of phishing attacks."
+        return Err(format!(
+            "redirect target carries a userinfo subcomponent — treated as an error per \
+             RFC 9110 §4.2.4 (likely authority obfuscation); target host would be {:?}",
+            host.unwrap_or("")
+        ));
+    }
+    if knobs.https_only() && to_scheme == "http" {
+        return Err(format!(
+            "redirect target {to} is plain http, refused by https_only policy"
+        ));
+    }
+    let from_scheme = from.scheme().unwrap_or("").to_ascii_lowercase();
+    match knobs.redirect_scheme_policy() {
+        RedirectSchemePolicy::Any => {}
+        RedirectSchemePolicy::Same => {
+            if from_scheme != to_scheme {
+                return Err(format!(
+                    "redirect hop changes scheme {from_scheme:?} → {to_scheme:?}, refused by \
+                     RedirectSchemePolicy::Same"
+                ));
+            }
+        }
+        RedirectSchemePolicy::UpgradeOnly => {
+            if from_scheme != to_scheme && !(from_scheme == "http" && to_scheme == "https") {
+                return Err(format!(
+                    "redirect hop changes scheme {from_scheme:?} → {to_scheme:?}, refused by \
+                     RedirectSchemePolicy::UpgradeOnly (only http → https may cross)"
+                ));
+            }
+        }
+    }
+    if knobs.redirect_same_host_only() {
+        let from_host = match from.authority_parts() {
+            Ok((_, h, _)) => h.unwrap_or("").to_ascii_lowercase(),
+            Err(_) => String::new(),
+        };
+        let to_host = host.unwrap_or("").to_ascii_lowercase();
+        if from_host != to_host {
+            return Err(format!(
+                "redirect hop changes host {from_host:?} → {to_host:?}, refused by \
+                 redirect_same_host_only policy"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The result of a redirect-following request walk.
+struct RedirectedResponse {
+    /// The first non-followed response (usually a non-3xx; a 3xx when
+    /// following is disabled, the cap was reached with
+    /// `max_redirects_will_error(false)`, or the 3xx carried no
+    /// Location).
+    resp: WireResponse,
+    /// URI whose request produced `resp` — the end of the hop walk.
+    final_uri: String,
+    /// URI that future requests for this resource should target: the
+    /// original request URI rewritten through the longest *permanent*
+    /// (301/308) prefix of the chain. The first temporary hop freezes
+    /// it — §15.4.3/§15.4.8 say to keep using the URI that answered
+    /// with the temporary redirect, and a 303 target is not the
+    /// resource at all (§15.4.4).
+    next_request_uri: String,
+}
+
+/// Issue `method` on `request_uri`, following 3xx redirects per the
+/// configured policy: Location parsed as a URI-reference and resolved
+/// against the current target URI (RFC 9110 §10.2.2 / RFC 3986 §5),
+/// hop cap, cyclical-redirection detection over RFC 9110
+/// §4.2.3-normalized URIs (§15.4 SHOULD), scheme/host policy, and
+/// userinfo rejection (§4.2.4).
+///
+/// `range_anchored` marks requests whose byte offsets and `If-Range`
+/// validator are anchored to an already-opened representation; a 303
+/// hop is fatal for those, because its target "is not considered
+/// equivalent to the target URI" (§15.4.4) and re-anchoring
+/// mid-stream against a different resource is exactly the
+/// misalignment the §13.1.5 machinery exists to prevent.
+///
+/// `label` prefixes every error message (e.g. `"HTTP HEAD http://…"`).
+fn call_with_redirects(
+    agent: &Agent,
+    method: RequestMethod,
+    request_uri: &str,
+    headers: &[(&str, &str)],
+    knobs: &HttpConfig,
+    range_anchored: bool,
+    label: &str,
+) -> io::Result<RedirectedResponse> {
+    let parsed = uri::UriRef::parse_lenient(request_uri)
+        .map_err(|e| io::Error::other(format!("{label}: invalid request URI: {e}")))?;
+    // Fragments are never part of a request target (RFC 9110 §4.2.5;
+    // RFC 3986 §5.1 also strips them from any base URI).
+    let mut current = parsed.without_fragment();
+    initial_uri_check(knobs, &current).map_err(|m| io::Error::other(format!("{label}: {m}")))?;
+    let mut sticky = current.to_string();
+    let mut sticky_frozen = false;
+    let mut visited: Vec<String> = vec![current.normalized()];
+    let mut hops: u32 = 0;
+    loop {
+        let uri_str = current.to_string();
+        let resp = send_once(agent, method, &uri_str, headers).map_err(|e| {
+            if hops == 0 {
+                io::Error::other(format!("{label}: {e}"))
+            } else {
+                io::Error::other(format!("{label}: redirect hop {hops} ({uri_str}): {e}"))
+            }
+        })?;
+        let status = resp.status().as_u16();
+        let done = |resp: WireResponse| RedirectedResponse {
+            resp,
+            final_uri: uri_str.clone(),
+            next_request_uri: sticky.clone(),
+        };
+        let Some(kind) = redirect_class(status) else {
+            return Ok(done(resp));
+        };
+        if !knobs.follow_redirects() {
+            // Following disabled: the 3xx is the final answer.
+            return Ok(done(resp));
+        }
+        // Location = URI-reference, a single field value (§10.2.2).
+        // The comma is a valid data character inside a URI-reference,
+        // so a list is not expressible; multiple field lines are the
+        // invalid-message case §10.2.2 warns about ("recovery ... is
+        // difficult and not interoperable") — refuse rather than
+        // guess.
+        let location: Option<std::result::Result<String, ()>> = {
+            let mut it = resp.headers().get_all("location").iter();
+            match (it.next(), it.next()) {
+                (None, _) => None,
+                (Some(v), None) => Some(v.to_str().map(str::to_owned).map_err(|_| ())),
+                (Some(_), Some(_)) => Some(Err(())),
+            }
+        };
+        let loc_value = match location {
+            // §15.4: "If a Location header field is provided, the
+            // user agent MAY automatically redirect" — without one
+            // there is nothing to follow; the 3xx is final.
+            None => return Ok(done(resp)),
+            Some(Err(())) => {
+                return Err(io::Error::other(format!(
+                    "{label}: status {status} with multiple (or non-ASCII) Location field \
+                     lines — a Location value cannot be a list (RFC 9110 §10.2.2)"
+                )));
+            }
+            Some(Ok(v)) => v,
+        };
+        if hops >= knobs.max_redirects() {
+            if knobs.max_redirects_will_error() {
+                return Err(io::Error::other(format!(
+                    "{label}: redirect chain exceeded max_redirects={} (status {status} at \
+                     {uri_str}, Location: {loc_value})",
+                    knobs.max_redirects()
+                )));
+            }
+            // Hand the last 3xx back; its status becomes the outcome.
+            return Ok(done(resp));
+        }
+        if range_anchored && status == 303 {
+            return Err(io::Error::other(format!(
+                "{label}: 303 See Other during a range-anchored request — the Location target \
+                 \"is not considered equivalent to the target URI\" (RFC 9110 §15.4.4), so the \
+                 byte offsets and If-Range validator of the open representation cannot be \
+                 re-anchored against it"
+            )));
+        }
+        // Strict parse: Location arrives from the network. §10.2.2
+        // allows recovery from invalid references but does not mandate
+        // it; this driver refuses them.
+        let reference = uri::UriRef::parse(&loc_value).map_err(|e| {
+            io::Error::other(format!(
+                "{label}: status {status} with invalid Location {loc_value:?}: {e}"
+            ))
+        })?;
+        // §10.2.2: relative references resolve against the target URI
+        // of the request that got the 3xx (RFC 3986 §5). A fragment
+        // (the target's own, or inherited from the request URI per
+        // §10.2.2 — a no-op here, `current` was fragment-stripped) is
+        // never sent in a request, so drop it for the next hop.
+        let target = current
+            .resolve(&reference)
+            .map_err(|e| {
+                io::Error::other(format!(
+                    "{label}: cannot resolve Location {loc_value:?} against {uri_str}: {e}"
+                ))
+            })?
+            .without_fragment();
+        hop_policy_check(knobs, &current, &target)
+            .map_err(|m| io::Error::other(format!("{label}: {m}")))?;
+        let key = target.normalized();
+        if visited.contains(&key) {
+            return Err(io::Error::other(format!(
+                "{label}: cyclical redirection — {key} already visited in this chain of {} \
+                 (RFC 9110 §15.4: a client SHOULD detect and intervene; §4.2.3: URIs \
+                 equivalent after normalization identify the same resource)",
+                visited.len()
+            )));
+        }
+        visited.push(key);
+        if status == 303 {
+            // §15.4.4: the Location target is a *different* resource —
+            // and the only one with a transferable representation ("a
+            // 303 response to a GET request indicates that the origin
+            // server does not have a representation of the target
+            // resource that can be transferred"). Future requests for
+            // the bytes this walk ends up reading therefore anchor at
+            // the 303 target: re-asking the original URI for byte
+            // ranges would ask a resource the origin said it cannot
+            // transfer. The rebase also unfreezes the rewrite — hops
+            // before the 303 concerned a different resource's
+            // whereabouts.
+            sticky = target.to_string();
+            sticky_frozen = false;
+        } else if !sticky_frozen {
+            match kind {
+                // §15.4.2 / §15.4.9: "any future references to this
+                // resource ought to use one of the enclosed URIs" —
+                // chainable only while every link so far is permanent.
+                HopKind::Permanent => sticky = target.to_string(),
+                // §15.4.3 / §15.4.8: "the client ought to continue to
+                // use the target URI for future requests" — freeze the
+                // rewrite at this point.
+                HopKind::Temporary => sticky_frozen = true,
+            }
+        }
+        hops += 1;
+        current = target;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HttpSource
 // ---------------------------------------------------------------------------
 
@@ -463,6 +914,12 @@ impl StrongValidator {
 
 /// `ReadSeek` over an HTTP/HTTPS resource, using `Range` requests.
 pub struct HttpSource {
+    /// Request URI for range GETs: the open URI rewritten through the
+    /// longest permanent (301/308) redirect prefix observed on the
+    /// most recent request chain (RFC 9110 §15.4.2 / §15.4.9 — "any
+    /// future references to this resource ought to use one of the
+    /// enclosed URIs"). Temporary hops (302/303/307) never rewrite it
+    /// and are re-walked on every request (§15.4.3 / §15.4.8).
     uri: String,
     total_len: u64,
     pos: u64,
@@ -483,11 +940,12 @@ pub struct HttpSource {
     /// (RFC 7233 §3.1) it is the remainder of the representation after
     /// the prefix drain. Meaningful only while `body` is `Some`.
     body_remaining: u64,
-    /// Transparent mid-body resume budget per `read` call — see
-    /// [`HttpConfig::read_retries`].
-    read_retries: u32,
-    /// Forward-seek drain cap — see [`HttpConfig::seek_drain_max`].
-    seek_drain_max: u64,
+    /// Resolved driver policy for this source: the mid-body resume
+    /// budget ([`HttpConfig::read_retries`]), the forward-seek drain
+    /// cap ([`HttpConfig::seek_drain_max`]), and the redirect policy
+    /// every per-request hop walk enforces
+    /// ([`HttpConfig::follow_redirects`] and friends).
+    knobs: HttpConfig,
 }
 
 impl HttpSource {
@@ -530,11 +988,22 @@ impl HttpSource {
         // real coding fall under rule 3's "not listed" and steering a
         // conformant server to "send a response without any content
         // coding".
-        let head = head_agent
-            .head(uri)
-            .header("Accept-Encoding", "identity")
-            .call()
-            .map_err(|e| Error::other(format!("HTTP HEAD {uri}: {e}")))?;
+        let head_walk = call_with_redirects(
+            head_agent,
+            RequestMethod::Head,
+            uri,
+            &[("Accept-Encoding", "identity")],
+            &knobs,
+            false,
+            &format!("HTTP HEAD {uri}"),
+        )
+        .map_err(|e| Error::other(e.to_string()))?;
+        // Driver-owned redirect semantics: subsequent range GETs
+        // target the open URI rewritten through the chain's permanent
+        // (301/308) prefix; temporary hops (302/303/307) are re-walked
+        // per request, per RFC 9110 §15.4.2/.9 vs §15.4.3/.8.
+        let request_uri = head_walk.next_request_uri;
+        let head = head_walk.resp;
 
         let status = head.status();
         if !status.is_success() {
@@ -547,7 +1016,7 @@ impl HttpSource {
             // instead.
             if knobs.range_probe() && (status == 405 || status == 501) {
                 return Self::probe_open(
-                    uri,
+                    &request_uri,
                     scoped,
                     &knobs,
                     None,
@@ -606,7 +1075,13 @@ impl HttpSource {
             // such a field on HEAD. The GET's own metadata is the
             // authoritative fallback when the caller opted in.
             None if knobs.range_probe() => {
-                return Self::probe_open(uri, scoped, &knobs, None, "HEAD omitted Content-Length");
+                return Self::probe_open(
+                    &request_uri,
+                    scoped,
+                    &knobs,
+                    None,
+                    "HEAD omitted Content-Length",
+                );
             }
             None => {
                 return Err(Error::Unsupported(format!(
@@ -653,7 +1128,7 @@ impl HttpSource {
                 // against the HEAD-observed length) prove support.
                 if knobs.range_probe() {
                     return Self::probe_open(
-                        uri,
+                        &request_uri,
                         scoped,
                         &knobs,
                         Some(total_len),
@@ -672,15 +1147,14 @@ impl HttpSource {
         }
         let validator = validator_with_vary_check(&format!("HTTP HEAD {uri}"), headers)?;
         Ok(Self {
-            uri: uri.to_owned(),
+            uri: request_uri,
             total_len,
             pos: 0,
             agent: scoped,
             validator,
             body: None,
             body_remaining: 0,
-            read_retries: knobs.read_retries(),
-            seek_drain_max: knobs.seek_drain_max(),
+            knobs,
         })
     }
 
@@ -712,12 +1186,23 @@ impl HttpSource {
         why: &str,
     ) -> Result<Self> {
         let probe_agent: &Agent = scoped.as_ref().unwrap_or_else(|| agent());
-        let resp = probe_agent
-            .get(uri)
-            .header("Range", "bytes=0-")
-            .header("Accept-Encoding", "identity")
-            .call()
-            .map_err(|e| Error::other(format!("HTTP GET probe {uri} ({why}): {e}")))?;
+        // The probe walks redirects like the HEAD it replaces. It is
+        // not range-anchored: nothing has been read yet, so even a 303
+        // hop (a *different* resource that answers indirectly,
+        // RFC 9110 §15.4.4) is safe to follow — whatever the chain
+        // ends at IS the representation this source will expose.
+        let probe_walk = call_with_redirects(
+            probe_agent,
+            RequestMethod::Get,
+            uri,
+            &[("Range", "bytes=0-"), ("Accept-Encoding", "identity")],
+            knobs,
+            false,
+            &format!("HTTP GET probe {uri} ({why})"),
+        )
+        .map_err(|e| Error::other(e.to_string()))?;
+        let request_uri = probe_walk.next_request_uri;
+        let resp = probe_walk.resp;
         let status = resp.status();
         if status == 416 {
             let cr_raw = resp
@@ -738,15 +1223,14 @@ impl HttpSource {
                 // issued (pos >= total holds from the start), so no
                 // validator is needed.
                 Ok(0) => Ok(Self {
-                    uri: uri.to_owned(),
+                    uri: request_uri,
                     total_len: 0,
                     pos: 0,
                     agent: scoped,
                     validator: None,
                     body: None,
                     body_remaining: 0,
-                    read_retries: knobs.read_retries(),
-                    seek_drain_max: knobs.seek_drain_max(),
+                    knobs: knobs.clone(),
                 }),
                 Ok(c) => Err(Error::other(format!(
                     "HTTP GET probe {uri} ({why}): 416 for 'bytes=0-' yet complete-length {c} \
@@ -862,15 +1346,14 @@ impl HttpSource {
         // discarding a perfectly good bytes 0-N transfer.
         let reader: Box<dyn Read + Send> = Box::new(resp.into_body().into_reader());
         Ok(Self {
-            uri: uri.to_owned(),
+            uri: request_uri,
             total_len,
             pos: 0,
             agent: scoped,
             validator,
             body: Some(reader),
             body_remaining: span,
-            read_retries: knobs.read_retries(),
-            seek_drain_max: knobs.seek_drain_max(),
+            knobs: knobs.clone(),
         })
     }
 
@@ -880,6 +1363,14 @@ impl HttpSource {
 
     pub fn is_empty(&self) -> bool {
         self.total_len == 0
+    }
+
+    /// The URI range GETs currently target: the open URI rewritten
+    /// through any permanent (301/308) redirect prefix observed on the
+    /// most recent request chain (RFC 9110 §15.4.2 / §15.4.9).
+    /// Temporary redirects (302/303/307) never rewrite it.
+    pub fn request_uri(&self) -> &str {
+        &self.uri
     }
 
     fn agent_ref(&self) -> &Agent {
@@ -934,17 +1425,34 @@ impl HttpSource {
         // bytes the demuxer reads (§8.4: representation metadata is
         // about the coded form). See the HEAD-side comment in
         // `open_impl` for the full rationale.
-        let mut req = self
-            .agent_ref()
-            .get(&self.uri)
-            .header("Range", &range)
-            .header("Accept-Encoding", "identity");
-        if let Some(ref v) = if_range {
-            req = req.header("If-Range", v.as_str());
+        let mut hdrs: Vec<(&str, &str)> = vec![("Range", &range), ("Accept-Encoding", "identity")];
+        if let Some(v) = if_range.as_deref() {
+            // The validator rides along on every hop: 301/302/307/308
+            // targets are the same resource at a different URI
+            // (RFC 9110 §15.4), so §13.1.5's mutation guard applies to
+            // whichever origin finally serves the bytes. A 303 target
+            // is a different resource — the walk below rejects it
+            // (`range_anchored`).
+            hdrs.push(("If-Range", v));
         }
-        let resp = req
-            .call()
-            .map_err(|e| io::Error::other(format!("HTTP GET {} {}: {e}", self.uri, range)))?;
+        // Range GETs re-walk redirects per request: temporary hops
+        // (302/307) were deliberately not baked into `self.uri`, and a
+        // permanent hop observed now rewrites it for the next request.
+        let walk = call_with_redirects(
+            self.agent_ref(),
+            RequestMethod::Get,
+            &self.uri,
+            &hdrs,
+            &self.knobs,
+            true,
+            &format!("HTTP GET {} {}", self.uri, range),
+        )?;
+        let resp = walk.resp;
+        // Error diagnostics below name the URI that actually answered.
+        let uri = walk.final_uri;
+        if walk.next_request_uri != self.uri {
+            self.uri = walk.next_request_uri;
+        }
         let status = resp.status();
         // RFC 9110 §15.5.17: a 416 (Range Not Satisfiable) means the
         // server has rejected our requested range. §14.4 SHOULDs a
@@ -964,13 +1472,13 @@ impl HttpSource {
                     Ok(complete) => {
                         return Err(io::Error::other(format!(
                             "HTTP 416 {} {}: server reports complete-length {complete} (HEAD observed {}, requested pos {})",
-                            self.uri, range, self.total_len, self.pos
+                            uri, range, self.total_len, self.pos
                         )));
                     }
                     Err(e) => {
                         return Err(io::Error::other(format!(
                             "HTTP 416 {} {}: invalid Content-Range '{cr}': {e}",
-                            self.uri, range
+                            uri, range
                         )));
                     }
                 }
@@ -980,13 +1488,13 @@ impl HttpSource {
             // the read can't proceed; just say so plainly.
             return Err(io::Error::other(format!(
                 "HTTP 416 {} {}: server rejected range (no Content-Range body)",
-                self.uri, range
+                uri, range
             )));
         }
         if !(status == 206 || status == 200) {
             return Err(io::Error::other(format!(
                 "HTTP GET {} {}: status {status}",
-                self.uri, range
+                uri, range
             )));
         }
         // RFC 9110 §8.4 + §12.5.3: we sent `Accept-Encoding: identity`,
@@ -1011,7 +1519,7 @@ impl HttpSource {
                 "HTTP {status} {} {}: response carries Content-Encoding {get_codings:?} \
                  despite 'Accept-Encoding: identity' (RFC 9110 §12.5.3) — per §8.4 the \
                  body and byte-range metadata describe the coded form, not the media bytes",
-                self.uri, range
+                uri, range
             )));
         }
         // RFC 9110 §13.1.5: when we sent `If-Range`, a 200 means the
@@ -1024,7 +1532,7 @@ impl HttpSource {
             return Err(io::Error::other(format!(
                 "HTTP 200 {} {}: If-Range validator did not match — \
                  representation changed since HEAD (origin/cache mutation)",
-                self.uri, range
+                uri, range
             )));
         }
         let pos = self.pos;
@@ -1063,7 +1571,7 @@ impl HttpSource {
                     return Err(io::Error::other(format!(
                         "HTTP 200 {} {}: Content-Length {cl} != HEAD-observed total {total_len} \
                          (RFC 9110 §8.6 — resource resized between HEAD and GET)",
-                        self.uri, range
+                        uri, range
                     )));
                 }
             }
@@ -1091,7 +1599,7 @@ impl HttpSource {
                 return Err(io::Error::other(format!(
                     "HTTP 206 {} {}: server returned multipart/byteranges to a single-range \
                      request (RFC 9110 §15.3.7.2 MUST NOT). Content-Type: {ct_raw:?}",
-                    self.uri, range
+                    uri, range
                 )));
             }
             // RFC 7233 §4.2: validate the server's Content-Range echo
@@ -1104,23 +1612,20 @@ impl HttpSource {
                 .headers()
                 .get("content-range")
                 .ok_or_else(|| {
-                    io::Error::other(format!(
-                        "HTTP 206 {} {}: missing Content-Range",
-                        self.uri, range
-                    ))
+                    io::Error::other(format!("HTTP 206 {} {}: missing Content-Range", uri, range))
                 })?
                 .to_str()
                 .map_err(|_| {
                     io::Error::other(format!(
                         "HTTP 206 {} {}: non-ASCII Content-Range",
-                        self.uri, range
+                        uri, range
                     ))
                 })?
                 .to_owned();
             let parsed = parse_byte_content_range(&cr_raw).map_err(|e| {
                 io::Error::other(format!(
                     "HTTP 206 {} {}: invalid Content-Range '{cr_raw}': {e}",
-                    self.uri, range
+                    uri, range
                 ))
             })?;
             // first-byte-pos MUST match the position we asked for. The
@@ -1129,7 +1634,7 @@ impl HttpSource {
             if parsed.first != pos {
                 return Err(io::Error::other(format!(
                     "HTTP 206 {} {}: Content-Range first-byte-pos {} != requested pos {}",
-                    self.uri, range, parsed.first, pos
+                    uri, range, parsed.first, pos
                 )));
             }
             // complete-length, when concrete, must equal the size we
@@ -1139,7 +1644,7 @@ impl HttpSource {
                 if complete != total_len {
                     return Err(io::Error::other(format!(
                         "HTTP 206 {} {}: Content-Range complete-length {complete} != known total {total_len}",
-                        self.uri, range
+                        uri, range
                     )));
                 }
             }
@@ -1148,7 +1653,7 @@ impl HttpSource {
             if parsed.last >= total_len {
                 return Err(io::Error::other(format!(
                     "HTTP 206 {} {}: Content-Range last-byte-pos {} >= total {}",
-                    self.uri, range, parsed.last, total_len
+                    uri, range, parsed.last, total_len
                 )));
             }
             // RFC 9110 §8.6: when a 206 carries Content-Length, it MUST
@@ -1166,7 +1671,7 @@ impl HttpSource {
                     return Err(io::Error::other(format!(
                         "HTTP 206 {} {}: Content-Length {cl} != Content-Range span {expected} \
                          (RFC 9110 §8.6)",
-                        self.uri, range
+                        uri, range
                     )));
                 }
             }
@@ -1197,7 +1702,7 @@ impl HttpSource {
                         io::ErrorKind::UnexpectedEof,
                         format!(
                             "HTTP 200 {}: EOF after draining {} of {skip_prefix} prefix bytes",
-                            self.uri,
+                            uri,
                             skip_prefix - remaining
                         ),
                     ));
@@ -2831,7 +3336,7 @@ impl Read for HttpSource {
             self.body = None;
             let missing = self.body_remaining;
             self.body_remaining = 0;
-            if attempts < self.read_retries {
+            if attempts < self.knobs.read_retries() {
                 // Resume: the next loop turn re-issues
                 // `Range: bytes=<pos>-` (+ `If-Range` when we hold a
                 // strong validator). `issue_range` failures — 416,
@@ -2896,7 +3401,7 @@ impl Seek for HttpSource {
             // exceeds `seek_drain_max`.
             let drained = new_pos > self.pos
                 && self.body.is_some()
-                && new_pos - self.pos <= self.seek_drain_max.min(self.body_remaining)
+                && new_pos - self.pos <= self.knobs.seek_drain_max().min(self.body_remaining)
                 && self.drain_forward(new_pos - self.pos);
             if !drained {
                 // Backward seek, long hop, span overrun, or a drain
@@ -3760,9 +4265,12 @@ mod tests {
     #[test]
     fn http_config_default_matches_documented_surface() {
         let c = HttpConfig::default();
+        assert!(c.follow_redirects());
         assert_eq!(c.max_redirects(), 10);
         assert!(c.max_redirects_will_error());
         assert_eq!(c.redirect_auth_policy(), RedirectAuthPolicy::Never);
+        assert_eq!(c.redirect_scheme_policy(), RedirectSchemePolicy::Any);
+        assert!(!c.redirect_same_host_only());
         assert_eq!(c.user_agent(), None);
         assert!(!c.https_only());
         assert_eq!(c.timeout_global(), None);
@@ -3775,9 +4283,12 @@ mod tests {
     #[test]
     fn http_config_builder_threads_values_through() {
         let c = HttpConfig::builder()
+            .follow_redirects(false)
             .max_redirects(3)
             .max_redirects_will_error(false)
             .redirect_auth_policy(RedirectAuthPolicy::SameHost)
+            .redirect_scheme_policy(RedirectSchemePolicy::Same)
+            .redirect_same_host_only(true)
             .user_agent("oxideav-test/0.0")
             .https_only(true)
             .timeout_global(Some(Duration::from_secs(30)))
@@ -3786,9 +4297,12 @@ mod tests {
             .seek_drain_max(123)
             .range_probe(true)
             .build();
+        assert!(!c.follow_redirects());
         assert_eq!(c.max_redirects(), 3);
         assert!(!c.max_redirects_will_error());
         assert_eq!(c.redirect_auth_policy(), RedirectAuthPolicy::SameHost);
+        assert_eq!(c.redirect_scheme_policy(), RedirectSchemePolicy::Same);
+        assert!(c.redirect_same_host_only());
         assert_eq!(c.user_agent(), Some("oxideav-test/0.0"));
         assert!(c.https_only());
         assert_eq!(c.timeout_global(), Some(Duration::from_secs(30)));
@@ -8077,5 +8591,348 @@ mod tests {
         assert_eq!(parse_one_auth_param("=novalue"), None);
         assert_eq!(parse_one_auth_param("bad()=x"), None);
         assert_eq!(parse_one_auth_param("k=\"unterminated"), None);
+    }
+
+    // -- Driver-owned redirects (RFC 9110 §15.4 / §10.2.2, RFC 3986 §5) ------
+
+    fn redirect_bytes(status: u16, location: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status} Redirect\r\n\
+             Location: {location}\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n\
+             \r\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn redirect_class_covers_the_15_4_taxonomy() {
+        // §15.4.2 / §15.4.9 — permanent; §15.4.3 / §15.4.4 / §15.4.8
+        // — temporary (303's target is "not considered equivalent to
+        // the target URI", so it must never rewrite future requests).
+        assert_eq!(redirect_class(301), Some(HopKind::Permanent));
+        assert_eq!(redirect_class(308), Some(HopKind::Permanent));
+        assert_eq!(redirect_class(302), Some(HopKind::Temporary));
+        assert_eq!(redirect_class(303), Some(HopKind::Temporary));
+        assert_eq!(redirect_class(307), Some(HopKind::Temporary));
+        // §15.4.1 (reactive negotiation), §15.4.5 (cache signal),
+        // §15.4.6/§15.4.7 (deprecated/reserved) are not auto-followed.
+        for s in [300, 304, 305, 306, 200, 206, 404] {
+            assert_eq!(redirect_class(s), None, "status {s}");
+        }
+    }
+
+    #[test]
+    fn redirect_hop_policy_gates_scheme_host_and_userinfo() {
+        let u = |s: &str| uri::UriRef::parse(s).expect("parse");
+        let any = HttpConfig::default();
+        let upgrade = HttpConfig::builder()
+            .redirect_scheme_policy(RedirectSchemePolicy::UpgradeOnly)
+            .build();
+        let same = HttpConfig::builder()
+            .redirect_scheme_policy(RedirectSchemePolicy::Same)
+            .build();
+        let host_pin = HttpConfig::builder().redirect_same_host_only(true).build();
+        let https_only = HttpConfig::builder().https_only(true).build();
+
+        // Scheme policy matrix.
+        assert!(hop_policy_check(&any, &u("https://h/a"), &u("http://h/b")).is_ok());
+        assert!(hop_policy_check(&upgrade, &u("http://h/a"), &u("https://h/b")).is_ok());
+        assert!(hop_policy_check(&upgrade, &u("http://h/a"), &u("http://h/b")).is_ok());
+        let e = hop_policy_check(&upgrade, &u("https://h/a"), &u("http://h/b")).unwrap_err();
+        assert!(e.contains("UpgradeOnly"), "{e}");
+        let e = hop_policy_check(&same, &u("http://h/a"), &u("https://h/b")).unwrap_err();
+        assert!(e.contains("Same"), "{e}");
+        assert!(hop_policy_check(&same, &u("https://h/a"), &u("https://h/b")).is_ok());
+
+        // https_only refuses plain-http hops even under Any.
+        let e = hop_policy_check(&https_only, &u("https://h/a"), &u("http://h/b")).unwrap_err();
+        assert!(e.contains("https_only"), "{e}");
+
+        // Host pinning: case-insensitive (RFC 3986 §6.2.2.1), port
+        // changes allowed, host changes refused.
+        assert!(hop_policy_check(
+            &host_pin,
+            &u("http://Host.example/a"),
+            &u("http://host.EXAMPLE/b")
+        )
+        .is_ok());
+        assert!(hop_policy_check(&host_pin, &u("http://h:1/a"), &u("http://h:2/b")).is_ok());
+        let e = hop_policy_check(&host_pin, &u("http://a.example/"), &u("http://b.example/"))
+            .unwrap_err();
+        assert!(e.contains("redirect_same_host_only"), "{e}");
+
+        // Non-http(s) target scheme refused under every policy.
+        let e = hop_policy_check(&any, &u("http://h/a"), &u("ftp://h/b")).unwrap_err();
+        assert!(e.contains("http/https only"), "{e}");
+
+        // Empty host: RFC 9110 §4.2.1/§4.2.2 MUST reject.
+        let e = hop_policy_check(&any, &u("http://h/a"), &u("http:///p")).unwrap_err();
+        assert!(e.contains("empty host"), "{e}");
+
+        // Userinfo target: §4.2.4 treat-as-error.
+        let e = hop_policy_check(&any, &u("http://h/a"), &u("http://u:p@h/b")).unwrap_err();
+        assert!(e.contains("userinfo") && e.contains("4.2.4"), "{e}");
+    }
+
+    #[test]
+    fn redirect_301_rewrites_future_requests_to_the_new_uri() {
+        // §15.4.2: "any future references to this resource ought to
+        // use one of the enclosed URIs" — after a permanent hop at
+        // open, range GETs go straight to the new URI, no re-hop.
+        let (uri, reqs) = spawn_script_server(vec![
+            redirect_bytes(301, "/moved"),
+            HEAD_10B_BYTES.to_vec(),
+            make_get_206("bytes 0-9/10", b"0123456789"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        assert!(
+            src.request_uri().ends_with("/moved"),
+            "permanent hop must rewrite the request URI: {}",
+            src.request_uri()
+        );
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 3, "{log:#?}");
+        assert!(log[0].starts_with("HEAD /x "), "{:?}", log[0]);
+        assert!(log[1].starts_with("HEAD /moved "), "{:?}", log[1]);
+        assert!(log[2].starts_with("GET /moved "), "{:?}", log[2]);
+    }
+
+    #[test]
+    fn redirect_302_keeps_original_uri_and_rewalks_per_request() {
+        // §15.4.3: "the client ought to continue to use the target
+        // URI for future requests" — the GET re-asks the original URI
+        // and follows the hop again.
+        let (uri, reqs) = spawn_script_server(vec![
+            redirect_bytes(302, "/tmp"),
+            HEAD_10B_BYTES.to_vec(),
+            redirect_bytes(302, "/tmp"),
+            make_get_206("bytes 0-9/10", b"0123456789"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        assert!(
+            src.request_uri().ends_with("/x"),
+            "temporary hop must NOT rewrite the request URI: {}",
+            src.request_uri()
+        );
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 4, "{log:#?}");
+        assert!(log[2].starts_with("GET /x "), "{:?}", log[2]);
+        assert!(log[3].starts_with("GET /tmp "), "{:?}", log[3]);
+    }
+
+    #[test]
+    fn redirect_permanent_prefix_rewrite_freezes_at_first_temporary_hop() {
+        // 308 (permanent) then 307 (temporary): the rewrite advances
+        // through the permanent link and freezes there — future
+        // requests start at the 308 target and re-walk the 307.
+        let (uri, reqs) = spawn_script_server(vec![
+            redirect_bytes(308, "/a"),
+            redirect_bytes(307, "/b"),
+            HEAD_10B_BYTES.to_vec(),
+            redirect_bytes(307, "/b"),
+            make_get_206("bytes 0-9/10", b"0123456789"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        assert!(src.request_uri().ends_with("/a"), "{}", src.request_uri());
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 5, "{log:#?}");
+        assert!(log[3].starts_with("GET /a "), "{:?}", log[3]);
+        assert!(log[4].starts_with("GET /b "), "{:?}", log[4]);
+    }
+
+    #[test]
+    fn redirect_303_at_open_follows_with_head_and_rebases_the_anchor() {
+        // §15.4.4: the user agent performs "a retrieval request
+        // targeting that URI (a GET or HEAD request if using HTTP)" —
+        // HEAD is already a retrieval request, so the method rides
+        // through unchanged. The 303 target is a *different* resource
+        // and the only one with a transferable representation, so the
+        // source anchors future range GETs there — re-asking /x for
+        // byte ranges would ask a resource the origin said it cannot
+        // transfer.
+        let (uri, reqs) = spawn_script_server(vec![
+            redirect_bytes(303, "/other"),
+            HEAD_10B_BYTES.to_vec(),
+            make_get_206("bytes 0-9/10", b"0123456789"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        assert!(
+            src.request_uri().ends_with("/other"),
+            "{}",
+            src.request_uri()
+        );
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 3, "{log:#?}");
+        assert!(log[1].starts_with("HEAD /other "), "{:?}", log[1]);
+        assert!(log[2].starts_with("GET /other "), "{:?}", log[2]);
+    }
+
+    #[test]
+    fn redirect_relative_location_resolves_per_rfc3986_section_5() {
+        // "moved" against ".../x" → "/moved" (§5.2.3 merge), then
+        // "sub/./a/../b" against "/moved" → "/sub/b" (§5.2.4
+        // remove_dot_segments).
+        let (uri, reqs) = spawn_script_server(vec![
+            redirect_bytes(301, "moved"),
+            redirect_bytes(301, "sub/./a/../b"),
+            HEAD_10B_BYTES.to_vec(),
+            make_get_206("bytes 0-9/10", b"0123456789"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        assert!(
+            src.request_uri().ends_with("/sub/b"),
+            "{}",
+            src.request_uri()
+        );
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 4, "{log:#?}");
+        assert!(log[1].starts_with("HEAD /moved "), "{:?}", log[1]);
+        assert!(log[2].starts_with("HEAD /sub/b "), "{:?}", log[2]);
+        assert!(log[3].starts_with("GET /sub/b "), "{:?}", log[3]);
+    }
+
+    #[test]
+    fn redirect_location_fragment_never_reaches_the_wire() {
+        // A fragment is client-side only (RFC 9110 §4.2.5); the hop
+        // target is requested without it.
+        let (uri, reqs) = spawn_script_server(vec![
+            redirect_bytes(301, "/y#s5.4"),
+            HEAD_10B_BYTES.to_vec(),
+            make_get_206("bytes 0-9/10", b"0123456789"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 3, "{log:#?}");
+        assert!(log[1].starts_with("HEAD /y "), "{:?}", log[1]);
+        assert!(!log[1].contains('#'), "{:?}", log[1]);
+    }
+
+    #[test]
+    fn redirect_follow_disabled_surfaces_the_3xx_status() {
+        let (uri, reqs) = spawn_script_server(vec![redirect_bytes(301, "/moved")]);
+        let cfg = HttpConfig::builder().follow_redirects(false).build();
+        let err = HttpSource::open_with_config(&uri, &cfg)
+            .err()
+            .expect("must fail");
+        assert!(err.to_string().contains("status 301"), "{err}");
+        assert_eq!(reqs.try_iter().count(), 1, "no hop may be followed");
+    }
+
+    #[test]
+    fn redirect_cap_exceeded_errors_by_default() {
+        let (uri, reqs) = spawn_script_server(vec![
+            redirect_bytes(301, "/a"),
+            redirect_bytes(301, "/b"),
+            redirect_bytes(301, "/c"),
+        ]);
+        let cfg = HttpConfig::builder().max_redirects(2).build();
+        let err = HttpSource::open_with_config(&uri, &cfg)
+            .err()
+            .expect("must fail");
+        assert!(err.to_string().contains("max_redirects=2"), "{err}");
+        assert_eq!(reqs.try_iter().count(), 3, "initial request + 2 hops");
+    }
+
+    #[test]
+    fn redirect_cap_with_will_error_false_surfaces_last_3xx() {
+        let (uri, reqs) =
+            spawn_script_server(vec![redirect_bytes(301, "/a"), redirect_bytes(301, "/b")]);
+        let cfg = HttpConfig::builder()
+            .max_redirects(1)
+            .max_redirects_will_error(false)
+            .build();
+        let err = HttpSource::open_with_config(&uri, &cfg)
+            .err()
+            .expect("must fail");
+        assert!(err.to_string().contains("status 301"), "{err}");
+        assert_eq!(reqs.try_iter().count(), 2);
+    }
+
+    #[test]
+    fn redirect_300_multiple_choices_is_not_auto_followed() {
+        // §15.4.1: following the optional Location of a 300 is a MAY
+        // this driver declines — picking a representation variant
+        // blind defeats byte-exactness.
+        let (uri, reqs) = spawn_script_server(vec![redirect_bytes(300, "/preferred")]);
+        let err = HttpSource::open(&uri).err().expect("must fail");
+        assert!(err.to_string().contains("status 300"), "{err}");
+        assert_eq!(reqs.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn redirect_range_get_carries_if_range_across_the_hop() {
+        // A permanent hop mid-walk targets the same resource at a new
+        // URI (§15.4.2), so the §13.1.5 validator must ride along and
+        // guard the final origin's answer.
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_10B_BYTES_ETAG.to_vec(),
+            redirect_bytes(301, "/moved"),
+            make_get_206("bytes 0-9/10", b"0123456789"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("read");
+        assert_eq!(&buf, b"0123456789");
+        let log: Vec<String> = reqs.try_iter().collect();
+        assert_eq!(log.len(), 3, "{log:#?}");
+        assert!(log[2].starts_with("GET /moved "), "{:?}", log[2]);
+        assert!(
+            log[2].to_ascii_lowercase().contains("if-range: \"v1\""),
+            "hop request must carry If-Range: {:?}",
+            log[2]
+        );
+        assert!(
+            log[2].to_ascii_lowercase().contains("range: bytes=0-"),
+            "{:?}",
+            log[2]
+        );
+        assert!(
+            src.request_uri().ends_with("/moved"),
+            "mid-stream permanent hop rewrites future requests: {}",
+            src.request_uri()
+        );
+    }
+
+    #[test]
+    fn redirect_303_mid_stream_is_fatal_for_range_anchored_requests() {
+        // §15.4.4: a 303 target "is not considered equivalent to the
+        // target URI" — re-anchoring byte offsets of an already-open
+        // representation against a *different* resource is exactly
+        // the misalignment the §13.1.5 machinery exists to prevent.
+        let (uri, reqs) = spawn_script_server(vec![
+            HEAD_10B_BYTES.to_vec(),
+            make_get_206("bytes 0-3/10", b"0123"),
+            redirect_bytes(303, "/elsewhere"),
+        ]);
+        let mut src = HttpSource::open(&uri).expect("open");
+        let mut buf = [0u8; 4];
+        std::io::Read::read_exact(&mut src, &mut buf).expect("first span");
+        let err = std::io::Read::read_exact(&mut src, &mut [0u8; 6]).unwrap_err();
+        assert!(
+            err.to_string().contains("303") && err.to_string().contains("not considered"),
+            "{err}"
+        );
+        assert_eq!(
+            reqs.try_iter().count(),
+            3,
+            "the 303 target must never be contacted"
+        );
     }
 }

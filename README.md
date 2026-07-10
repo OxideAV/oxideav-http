@@ -26,19 +26,20 @@ let _r = ctx.sources.open("https://example.com/clip.mp4")?;
 
 ## Configuring the agent
 
-The default agent uses `ureq` defaults. To tighten policy (cap redirects,
-strip `Authorization` on cross-host redirects, require https, set a
-custom `User-Agent`, bound connect/global timeouts) build an
-`HttpConfig` and either install it process-wide or scope it to one
-source:
+To tighten policy (redirect following, hop cap, cross-scheme/cross-host
+redirect restrictions, require https, set a custom `User-Agent`, bound
+connect/global timeouts) build an `HttpConfig` and either install it
+process-wide or scope it to one source:
 
 ```rust
 use std::time::Duration;
-use oxideav_http::{HttpConfig, RedirectAuthPolicy, HttpSource, install_default_config};
+use oxideav_http::{HttpConfig, RedirectSchemePolicy, HttpSource, install_default_config};
 
 let cfg = HttpConfig::builder()
+    .follow_redirects(true)     // off = the first 3xx is the final answer
     .max_redirects(5)
-    .redirect_auth_policy(RedirectAuthPolicy::SameHost)
+    .redirect_scheme_policy(RedirectSchemePolicy::UpgradeOnly) // no https→http hops
+    .redirect_same_host_only(true) // refuse cross-host hops
     .user_agent("my-app/1.0")
     .https_only(true)
     .timeout_connect(Some(Duration::from_secs(5)))
@@ -60,6 +61,57 @@ let _src = HttpSource::open_with_config("https://example.com/clip.mp4", &cfg)?;
 once the process-wide agent has materialised. Call it before the first
 `ctx.sources.open(...)` if you need it to take effect on
 registry-dispatched opens.
+
+## Driver-owned redirects (RFC 9110 §15.4 / §10.2.2, RFC 3986 §5)
+
+The driver follows 3xx redirects itself — the transport layer hands
+every 3xx back unfollowed — so redirect semantics compose with the
+Range/If-Range machinery instead of happening underneath it:
+
+- **Location resolution**: `Location` is a URI-reference (§10.2.2),
+  parsed strictly against the RFC 3986 grammar (it arrives from the
+  network) and resolved against the current target URI with the §5.2.2
+  strict transform (`merge` + `remove_dot_segments`); the public
+  `oxideav_http::uri` module implements all of RFC 3986 §5, pinned by
+  the 41 resolution examples of §5.4. Fragments never reach the wire.
+- **Class semantics**: 301/308 (permanent) rewrite the URI that
+  future range GETs target — chained while every link so far is
+  permanent; 302/307 (temporary) never rewrite and are re-walked on
+  every request, per §15.4.2/.9 vs §15.4.3/.8. A 303 at open *rebases*
+  the anchor to its target: per §15.4.4 the original resource has no
+  transferable representation, so the target is the only thing a byte
+  source can read. A 303 during a range-anchored GET is fatal — its
+  target "is not considered equivalent to the target URI", and
+  re-anchoring live byte offsets against a different resource is the
+  exact misalignment the §13.1.5 validator machinery exists to
+  prevent. 300 is reactive negotiation (following its optional
+  Location is a MAY this driver declines) and 304 can never legally
+  answer our unconditional requests; both surface as status errors.
+- **Method**: only safe retrieval methods (HEAD/GET) are ever sent, so
+  the §15.4 method-rewrite rules are vacuous: 307/308 MUST NOT change
+  the method, 301/302's POST→GET latitude doesn't apply, and 303 asks
+  for "a GET or HEAD request" — which is what was already in flight.
+- **Policy**: hop cap (`max_redirects`, default 10; exceeding it
+  errors, or surfaces the last 3xx with
+  `max_redirects_will_error(false)`), an on/off switch
+  (`follow_redirects`), cross-scheme control
+  (`RedirectSchemePolicy::Any`/`UpgradeOnly`/`Same`), cross-host
+  pinning (`redirect_same_host_only`), and `https_only` enforced on
+  every hop.
+- **Hostile chains**: cyclical redirections are detected over RFC 9110
+  §4.2.3-normalized URIs (§15.4 SHOULD) independent of the hop cap;
+  a `Location` bearing a userinfo subcomponent is refused per §4.2.4
+  (authority obfuscation / phishing vector); multiple `Location` field
+  lines, out-of-grammar URIs, empty-host targets (§4.2.1/§4.2.2 MUST
+  reject), and non-http(s) schemes are all refused with precise cites.
+- **Range interaction**: `Range`, `If-Range`, and
+  `Accept-Encoding: identity` ride along on every hop — a
+  301/302/307/308 target is the same resource at another URI, so the
+  §13.1.5 validator guards whichever origin finally answers. The
+  response validation gauntlet (Content-Range echo, complete-length,
+  §8.6 Content-Length) runs against the final response regardless of
+  how many hops preceded it. `Authorization` is never generated and
+  never carried across a hop.
 
 ## Accept-Ranges classification (RFC 9110 §14.3)
 

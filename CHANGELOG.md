@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Driver-owned redirect semantics (RFC 9110 §15.4 / §10.2.2 + RFC 3986
+  §5): the driver now walks 3xx chains itself — the transport layer
+  returns every 3xx unfollowed — so redirects compose with the
+  Range/If-Range machinery. `Location` is strictly parsed as a
+  URI-reference and resolved against the current target URI (§10.2.2 /
+  §5.2.2); permanent hops (301/308) rewrite the URI future range GETs
+  target (chained while every link is permanent, frozen at the first
+  temporary hop); temporary hops (302/307) are re-walked per request;
+  a 303 at open rebases the anchor to its target (§15.4.4: the
+  original resource has no transferable representation) while a 303
+  during a range-anchored GET is fatal (its target "is not considered
+  equivalent to the target URI" — re-anchoring live byte offsets
+  against a different resource is the §13.1.5 misalignment case); 300
+  and 304 are never auto-followed. Cyclical redirections are detected
+  over RFC 9110 §4.2.3-normalized URIs independent of the hop cap;
+  hostile `Location` values — userinfo-bearing (§4.2.4 treat-as-error),
+  empty-host (§4.2.1/§4.2.2 MUST reject), out-of-grammar, non-http(s)
+  scheme, multiple field lines — are refused with precise cites.
+  `Range`, `If-Range`, and `Accept-Encoding: identity` ride along on
+  every hop; `Authorization` is never generated and never crosses a
+  hop. New `HttpConfig` knobs: `follow_redirects` (default `true`),
+  `redirect_scheme_policy`
+  (`RedirectSchemePolicy::Any`/`UpgradeOnly`/`Same`, default `Any`),
+  `redirect_same_host_only` (default `false`); the existing
+  `max_redirects` / `max_redirects_will_error` now govern the driver's
+  own walk (same defaults, same observable behaviour). New
+  `HttpSource::request_uri()` exposes the current anchor.
+
 - `oxideav_http::uri` — an RFC 3986 URI-reference module: strict and
   lenient parsing against the Appendix A collected ABNF (five-component
   split per §3 with the Appendix B first-match-wins disambiguation),
