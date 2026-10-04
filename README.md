@@ -14,6 +14,8 @@ Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework â€
 
 ```toml
 [dependencies]
+oxideav-core = "0.1"
+oxideav-source = "0.1"
 oxideav-http = "0.0"
 ```
 
@@ -22,6 +24,7 @@ let mut ctx = oxideav_core::RuntimeContext::new();
 ctx.sources = oxideav_source::with_defaults();
 oxideav_http::register(&mut ctx); // installs http:// + https://
 let _r = ctx.sources.open("https://example.com/clip.mp4")?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ## Configuring the agent
@@ -55,6 +58,7 @@ install_default_config(cfg.clone()).ok();
 
 // (B) or scope per-call without touching the global agent:
 let _src = HttpSource::open_with_config("https://example.com/clip.mp4", &cfg)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 `install_default_config` is one-shot â€” it returns `ConfigAlreadyInstalled`
