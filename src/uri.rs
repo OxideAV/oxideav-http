@@ -181,18 +181,18 @@ impl UriRef {
         // (`path-noscheme` excludes it, Appendix A); "./x:y" is the
         // standard escape for such paths.
         let mut scheme = None;
-        if let Some(idx) = rest.find([':', '/', '?', '#']) {
-            if rest.as_bytes()[idx] == b':' {
-                let candidate = &rest[..idx];
-                if !is_valid_scheme(candidate) {
-                    return Err(err(format!(
-                        "first path segment of a relative reference cannot contain ':' \
+        if let Some(idx) = rest.find([':', '/', '?', '#'])
+            && rest.as_bytes()[idx] == b':'
+        {
+            let candidate = &rest[..idx];
+            if !is_valid_scheme(candidate) {
+                return Err(err(format!(
+                    "first path segment of a relative reference cannot contain ':' \
                          and {candidate:?} is not a valid scheme (RFC 3986 Appendix A)"
-                    )));
-                }
-                scheme = Some(candidate.to_owned());
-                rest = &rest[idx + 1..];
+                )));
             }
+            scheme = Some(candidate.to_owned());
+            rest = &rest[idx + 1..];
         }
         // authority: introduced by "//", runs to the next "/", "?"
         // or "#" (§3.2).
@@ -370,10 +370,10 @@ impl UriRef {
                 None => (hostport, None),
             }
         };
-        if let Some(p) = port {
-            if !p.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(err(format!("port {p:?} is not *DIGIT (RFC 3986 §3.2.3)")));
-            }
+        if let Some(p) = port
+            && !p.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err(err(format!("port {p:?} is not *DIGIT (RFC 3986 §3.2.3)")));
         }
         Ok((userinfo, Some(host), port))
     }

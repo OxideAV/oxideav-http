@@ -89,6 +89,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- edition 2024, MSRV 1.95
 - The HEAD path's Content-Encoding walk, Retry-After hint rendering,
   and validator + `Vary: *` stability check are now shared helpers
   reused verbatim by the probe path (`non_identity_codings_in`,

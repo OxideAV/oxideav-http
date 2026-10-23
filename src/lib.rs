@@ -1334,13 +1334,13 @@ impl HttpSource {
             .get("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
-        if let Some(cl) = cl {
-            if cl != span {
-                return Err(Error::other(format!(
-                    "HTTP GET probe {uri} ({why}): Content-Length {cl} != Content-Range span \
+        if let Some(cl) = cl
+            && cl != span
+        {
+            return Err(Error::other(format!(
+                "HTTP GET probe {uri} ({why}): Content-Length {cl} != Content-Range span \
                      {span} (RFC 9110 §8.6)"
-                )));
-            }
+            )));
         }
         let validator = validator_with_vary_check(&format!("HTTP GET probe {uri}"), headers)?;
         // The probe response IS the first range response — hand its
@@ -1567,16 +1567,15 @@ impl HttpSource {
         // self-descriptive and may cover less than the requested
         // open-ended range).
         let mut span = total_len - pos;
-        if status == 200 {
-            if let Some(cl) = get_content_length {
-                if cl != total_len {
-                    return Err(io::Error::other(format!(
-                        "HTTP 200 {} {}: Content-Length {cl} != HEAD-observed total {total_len} \
+        if status == 200
+            && let Some(cl) = get_content_length
+            && cl != total_len
+        {
+            return Err(io::Error::other(format!(
+                "HTTP 200 {} {}: Content-Length {cl} != HEAD-observed total {total_len} \
                          (RFC 9110 §8.6 — resource resized between HEAD and GET)",
-                        uri, range
-                    )));
-                }
-            }
+                uri, range
+            )));
         }
         if status == 206 {
             // RFC 9110 §15.3.7.2 ("A server MUST NOT generate a multipart
@@ -1642,13 +1641,13 @@ impl HttpSource {
             // complete-length, when concrete, must equal the size we
             // recorded at HEAD. A mid-stream resource resize is a
             // cache/origin mismatch we cannot recover from in-band.
-            if let Some(complete) = parsed.complete {
-                if complete != total_len {
-                    return Err(io::Error::other(format!(
-                        "HTTP 206 {} {}: Content-Range complete-length {complete} != known total {total_len}",
-                        uri, range
-                    )));
-                }
+            if let Some(complete) = parsed.complete
+                && complete != total_len
+            {
+                return Err(io::Error::other(format!(
+                    "HTTP 206 {} {}: Content-Range complete-length {complete} != known total {total_len}",
+                    uri, range
+                )));
             }
             // last-byte-pos must lie inside the representation we
             // expect.
@@ -3148,12 +3147,11 @@ fn derive_strong_validator(
     last_modified: Option<&str>,
     date: Option<&str>,
 ) -> Option<StrongValidator> {
-    if let Some(raw) = etag {
-        if let Some((is_weak, wire)) = parse_entity_tag(raw) {
-            if !is_weak {
-                return Some(StrongValidator::Etag(wire));
-            }
-        }
+    if let Some(raw) = etag
+        && let Some((is_weak, wire)) = parse_entity_tag(raw)
+        && !is_weak
+    {
+        return Some(StrongValidator::Etag(wire));
     }
     if let (Some(lm), Some(dt)) = (last_modified, date) {
         // §5.6.7 makes accepting all three HTTP-date forms a MUST on
@@ -3256,16 +3254,17 @@ fn validator_with_vary_check(
         .get("vary")
         .and_then(|v| v.to_str().ok())
         .map(normalize_obs_fold);
-    if let Some(vary_raw) = vary_owned.as_deref() {
-        if parse_vary(vary_raw) == Vary::Wildcard && validator.is_none() {
-            return Err(Error::Unsupported(format!(
-                "{ctx}: response carries 'Vary: *' (RFC 9110 §12.5.5) with no \
+    if let Some(vary_raw) = vary_owned.as_deref()
+        && parse_vary(vary_raw) == Vary::Wildcard
+        && validator.is_none()
+    {
+        return Err(Error::Unsupported(format!(
+            "{ctx}: response carries 'Vary: *' (RFC 9110 §12.5.5) with no \
                  strong validator (ETag / promotable Last-Modified) — the origin warns the \
                  representation may be selected on aspects outside the message syntax, so a \
                  later Range GET could serve a different representation the driver cannot \
                  detect (no If-Range guard per §13.1.5)"
-            )));
-        }
+        )));
     }
     Ok(validator)
 }
@@ -3627,10 +3626,10 @@ fn apply_directive(cc: &mut CacheControl, name: &str, arg: Option<String>) {
     // delta-seconds helper: first-occurrence-wins (§4.2.1) on the
     // already-populated slot.
     fn set_delta(slot: &mut Option<u64>, arg: &Option<String>) {
-        if slot.is_none() {
-            if let Some(a) = arg {
-                *slot = parse_delta_seconds(a);
-            }
+        if slot.is_none()
+            && let Some(a) = arg
+        {
+            *slot = parse_delta_seconds(a);
         }
     }
     // #field-name argument splitter for the qualified no-cache / private
@@ -3877,12 +3876,11 @@ pub fn parse_www_authenticate(s: &str) -> Vec<Challenge> {
             // auth-params (§11.3 mutual exclusivity); in that case, and
             // when there is no current challenge at all, the orphan slot
             // is dropped.
-            if let Some(cur) = out.last_mut() {
-                if cur.token68.is_none() {
-                    if let Some(pair) = parse_one_auth_param(elem) {
-                        cur.params.push(pair);
-                    }
-                }
+            if let Some(cur) = out.last_mut()
+                && cur.token68.is_none()
+                && let Some(pair) = parse_one_auth_param(elem)
+            {
+                cur.params.push(pair);
             }
         }
     }
@@ -8710,12 +8708,14 @@ mod tests {
 
         // Host pinning: case-insensitive (RFC 3986 §6.2.2.1), port
         // changes allowed, host changes refused.
-        assert!(hop_policy_check(
-            &host_pin,
-            &u("http://Host.example/a"),
-            &u("http://host.EXAMPLE/b")
-        )
-        .is_ok());
+        assert!(
+            hop_policy_check(
+                &host_pin,
+                &u("http://Host.example/a"),
+                &u("http://host.EXAMPLE/b")
+            )
+            .is_ok()
+        );
         assert!(hop_policy_check(&host_pin, &u("http://h:1/a"), &u("http://h:2/b")).is_ok());
         let e = hop_policy_check(&host_pin, &u("http://a.example/"), &u("http://b.example/"))
             .unwrap_err();
@@ -9033,12 +9033,14 @@ mod tests {
         // `Location:` with an empty value is a valid URI-reference
         // that resolves to the request URI itself (RFC 3986 §5.2.2's
         // empty-path branch) — cyclical, not followable.
-        let (uri, reqs) = spawn_script_server(vec![b"HTTP/1.1 301 Moved\r\n\
+        let (uri, reqs) = spawn_script_server(vec![
+            b"HTTP/1.1 301 Moved\r\n\
               Location: \r\n\
               Content-Length: 0\r\n\
               Connection: close\r\n\
               \r\n"
-            .to_vec()]);
+                .to_vec(),
+        ]);
         let err = HttpSource::open(&uri).err().expect("must fail");
         assert!(err.to_string().contains("cyclical"), "{err}");
         assert_eq!(reqs.try_iter().count(), 1);
@@ -9102,11 +9104,13 @@ mod tests {
         // §15.4: "If a Location header field is provided, the user
         // agent MAY automatically redirect" — without one there is
         // nothing to follow; the 3xx is the final answer.
-        let (uri, reqs) = spawn_script_server(vec![b"HTTP/1.1 301 Moved\r\n\
+        let (uri, reqs) = spawn_script_server(vec![
+            b"HTTP/1.1 301 Moved\r\n\
               Content-Length: 0\r\n\
               Connection: close\r\n\
               \r\n"
-            .to_vec()]);
+                .to_vec(),
+        ]);
         let err = HttpSource::open(&uri).err().expect("must fail");
         assert!(err.to_string().contains("status 301"), "{err}");
         assert_eq!(reqs.try_iter().count(), 1);
@@ -9117,13 +9121,15 @@ mod tests {
         // §10.2.2 note: a Location value cannot be a list; multiple
         // field lines come from an invalid message and recovery "is
         // difficult and not interoperable" — refuse rather than pick.
-        let (uri, reqs) = spawn_script_server(vec![b"HTTP/1.1 301 Moved\r\n\
+        let (uri, reqs) = spawn_script_server(vec![
+            b"HTTP/1.1 301 Moved\r\n\
               Location: /a\r\n\
               Location: /b\r\n\
               Content-Length: 0\r\n\
               Connection: close\r\n\
               \r\n"
-            .to_vec()]);
+                .to_vec(),
+        ]);
         let err = HttpSource::open(&uri).err().expect("must fail");
         assert!(err.to_string().contains("multiple"), "{err}");
         assert_eq!(
@@ -9288,13 +9294,15 @@ mod tests {
         // The driver never sleeps, but when a 3xx surfaces (following
         // disabled) the parsed hint must ride the error so a caller
         // wiring back-off has it without re-fetching.
-        let (uri, _reqs) = spawn_script_server(vec![b"HTTP/1.1 302 Found\r\n\
+        let (uri, _reqs) = spawn_script_server(vec![
+            b"HTTP/1.1 302 Found\r\n\
               Location: /busy\r\n\
               Retry-After: 120\r\n\
               Content-Length: 0\r\n\
               Connection: close\r\n\
               \r\n"
-            .to_vec()]);
+                .to_vec(),
+        ]);
         let cfg = HttpConfig::builder().follow_redirects(false).build();
         let err = HttpSource::open_with_config(&uri, &cfg)
             .err()
