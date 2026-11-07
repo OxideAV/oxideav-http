@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-http/compare/v0.0.9...v0.0.10) - 2026-11-07
+
+### Other
+
+- API hygiene: non_exhaustive policy enums + parsed header records
+
 ### Added
 
 - `with_<field>` setters on `CacheControl` and `Challenge` (both already `Default`).
