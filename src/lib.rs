@@ -164,6 +164,7 @@ pub fn open_http(uri: &str) -> Result<Box<dyn BytesSource>> {
 /// `Authorization` among the resource-specific fields to remove. Both
 /// variants therefore currently behave as [`RedirectAuthPolicy::Never`].
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum RedirectAuthPolicy {
     /// Strip `Authorization` on every redirect.
     #[default]
@@ -180,6 +181,7 @@ pub enum RedirectAuthPolicy {
 /// Independent of [`HttpConfigBuilder::https_only`], which refuses
 /// every non-`https` request outright, including the first one.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum RedirectSchemePolicy {
     /// `http` ↔ `https` hops are allowed in both directions (default —
     /// matches the historical transparent-following behaviour).
@@ -3485,6 +3487,7 @@ fn parse_delta_seconds(arg: &str) -> Option<u64> {
 /// valued directive (later duplicates of `max-age`, `s-maxage`, etc. are
 /// dropped). A boolean directive appearing more than once is idempotent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CacheControl {
     /// `max-age` (§5.2.1.1 request / §5.2.2.1 response) `delta-seconds`,
     /// §1.2.2-saturated. `None` when absent or carrying a non-`1*DIGIT`
@@ -3529,6 +3532,120 @@ pub struct CacheControl {
     /// Unrecognized / extension directives (§5.2.3), preserved as
     /// `(lowercased token, optional decoded argument)` in wire order.
     pub extensions: Vec<(String, Option<String>)>,
+}
+
+impl CacheControl {
+    /// Set `max_age`.
+    #[must_use]
+    pub fn with_max_age(mut self, v: Option<u64>) -> Self {
+        self.max_age = v;
+        self
+    }
+
+    /// Set `s_maxage`.
+    #[must_use]
+    pub fn with_s_maxage(mut self, v: Option<u64>) -> Self {
+        self.s_maxage = v;
+        self
+    }
+
+    /// Set `max_stale`.
+    #[must_use]
+    pub fn with_max_stale(mut self, v: Option<Option<u64>>) -> Self {
+        self.max_stale = v;
+        self
+    }
+
+    /// Set `min_fresh`.
+    #[must_use]
+    pub fn with_min_fresh(mut self, v: Option<u64>) -> Self {
+        self.min_fresh = v;
+        self
+    }
+
+    /// Set `no_cache`.
+    #[must_use]
+    pub fn with_no_cache(mut self, v: bool) -> Self {
+        self.no_cache = v;
+        self
+    }
+
+    /// Set `no_cache_fields`.
+    #[must_use]
+    pub fn with_no_cache_fields(mut self, v: Vec<String>) -> Self {
+        self.no_cache_fields = v;
+        self
+    }
+
+    /// Set `no_store`.
+    #[must_use]
+    pub fn with_no_store(mut self, v: bool) -> Self {
+        self.no_store = v;
+        self
+    }
+
+    /// Set `no_transform`.
+    #[must_use]
+    pub fn with_no_transform(mut self, v: bool) -> Self {
+        self.no_transform = v;
+        self
+    }
+
+    /// Set `only_if_cached`.
+    #[must_use]
+    pub fn with_only_if_cached(mut self, v: bool) -> Self {
+        self.only_if_cached = v;
+        self
+    }
+
+    /// Set `must_revalidate`.
+    #[must_use]
+    pub fn with_must_revalidate(mut self, v: bool) -> Self {
+        self.must_revalidate = v;
+        self
+    }
+
+    /// Set `must_understand`.
+    #[must_use]
+    pub fn with_must_understand(mut self, v: bool) -> Self {
+        self.must_understand = v;
+        self
+    }
+
+    /// Set `private`.
+    #[must_use]
+    pub fn with_private(mut self, v: bool) -> Self {
+        self.private = v;
+        self
+    }
+
+    /// Set `private_fields`.
+    #[must_use]
+    pub fn with_private_fields(mut self, v: Vec<String>) -> Self {
+        self.private_fields = v;
+        self
+    }
+
+    /// Set `proxy_revalidate`.
+    #[must_use]
+    pub fn with_proxy_revalidate(mut self, v: bool) -> Self {
+        self.proxy_revalidate = v;
+        self
+    }
+
+    /// Set `public`.
+    #[must_use]
+    pub fn with_public(mut self, v: bool) -> Self {
+        self.public = v;
+        self
+    }
+
+    /// Set `extensions`.
+    #[must_use]
+    pub fn with_extensions(mut self, v: Vec<(String, Option<String>)>) -> Self {
+        self.extensions = v;
+        self
+    }
 }
 
 /// Parse a `Cache-Control` field value per RFC 9111 §5.2.
@@ -3749,6 +3866,7 @@ fn split_directive_list(s: &str) -> Vec<&str> {
 /// one challenge, so [`token68`](Challenge::token68) and
 /// [`params`](Challenge::params) are never both populated.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Challenge {
     /// `auth-scheme` (§11.1) — "a case-insensitive token to identify the
     /// authentication scheme", lowercased here so `Basic` / `basic`
@@ -3766,6 +3884,29 @@ pub struct Challenge {
     /// folded). Empty when the challenge had no argument or carried a
     /// `token68`.
     pub params: Vec<(String, String)>,
+}
+
+impl Challenge {
+    /// Set `scheme`.
+    #[must_use]
+    pub fn with_scheme(mut self, v: String) -> Self {
+        self.scheme = v;
+        self
+    }
+
+    /// Set `token68`.
+    #[must_use]
+    pub fn with_token68(mut self, v: Option<String>) -> Self {
+        self.token68 = v;
+        self
+    }
+
+    /// Set `params`.
+    #[must_use]
+    pub fn with_params(mut self, v: Vec<(String, String)>) -> Self {
+        self.params = v;
+        self
+    }
 }
 
 /// Parse a `WWW-Authenticate` / `Proxy-Authenticate` field value into a

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `with_<field>` setters on `CacheControl` and `Challenge` (both already `Default`).
+
+### Changed
+
+- API hygiene: `RedirectAuthPolicy`, `RedirectSchemePolicy`, `CacheControl` and `Challenge` are now `#[non_exhaustive]`. `RetryAfter` (the two RFC 9110 §10.2.3 forms) stays exhaustive. `uri` and `__fuzz` were already `#[doc(hidden)]`.
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-http/compare/v0.0.8...v0.0.9) - 2026-10-23
 
 ### Other
